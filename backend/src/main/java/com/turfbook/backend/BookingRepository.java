@@ -14,4 +14,8 @@ public interface BookingRepository extends MongoRepository<Booking, String> {
     Optional<Booking> findByBookingReference(String bookingReference);
 
     boolean existsBySlotKeysInAndStatus(Collection<String> slotKeys, String status);
+    
+    List<Booking> findByCustomerIdOrderByBookingDateDescStartTimeDesc(String customerId);
+
+    List<Booking> findByCustomerIdOrderByCreatedAtDesc(String customerId);
 }

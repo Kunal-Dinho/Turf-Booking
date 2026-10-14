@@ -6,14 +6,22 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.FindAndModifyOptions;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.index.Index;
+import org.springframework.data.mongodb.core.index.IndexInfo;
+import org.springframework.data.mongodb.core.index.IndexOperations;
+import org.springframework.data.mongodb.core.index.PartialIndexFilter;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -40,16 +48,36 @@ public class BookingService {
 
     /**
      * Programmatically ensures database indexes exist in MongoDB Atlas.
-     * The unique index on `slotKeys` guarantees double-booking prevention under concurrent requests.
+     * Uses a partial unique index on `slotKeys` filtering on status="CONFIRMED"
+     * so that cancelled bookings automatically release their time slots at the storage level.
      */
     @EventListener(ApplicationReadyEvent.class)
     public void ensureIndexes() {
         try {
-            mongoTemplate.indexOps(Booking.class).ensureIndex(
-                new Index().on("slotKeys", Sort.Direction.ASC).unique()
+            IndexOperations indexOps = mongoTemplate.indexOps(Booking.class);
+            List<IndexInfo> indexInfoList = indexOps.getIndexInfo();
+            for (IndexInfo info : indexInfoList) {
+                if ("slotKeys_1".equals(info.getName()) || "slotKeys".equals(info.getName())) {
+                    String partialFilter = info.getPartialFilterExpression();
+                    if (partialFilter == null || !partialFilter.contains("CONFIRMED")) {
+                        log.info("Migrating legacy slotKeys index to partial unique index (status=CONFIRMED)...");
+                        indexOps.dropIndex(info.getName());
+                        break;
+                    }
+                }
+            }
+
+            indexOps.ensureIndex(
+                new Index()
+                    .on("slotKeys", Sort.Direction.ASC)
+                    .unique()
+                    .partial(PartialIndexFilter.of(Criteria.where("status").is("CONFIRMED")))
             );
-            mongoTemplate.indexOps(Booking.class).ensureIndex(
+            indexOps.ensureIndex(
                 new Index().on("bookingReference", Sort.Direction.ASC).unique()
+            );
+            indexOps.ensureIndex(
+                new Index().on("customerId", Sort.Direction.ASC).on("bookingDate", Sort.Direction.DESC).on("startTime", Sort.Direction.DESC)
             );
             log.info("Booking unique indices initialized successfully.");
         } catch (Exception e) {
@@ -88,9 +116,16 @@ public class BookingService {
     }
 
     /**
-     * Creates a new booking after rigorous server-side validation and price computation.
+     * Creates a new booking reservation (guest or authenticated).
      */
     public BookingResponse createBooking(BookingRequest request) {
+        return createBooking(request, null);
+    }
+
+    /**
+     * Creates a new booking reservation with authenticated customer linkage.
+     */
+    public BookingResponse createBooking(BookingRequest request, String authenticatedCustomerId) {
         // 1. Fetch turf to verify existence and get authoritative price per hour
         Turf turf = turfRepository.findById(request.getTurfId())
                 .orElseThrow(() -> new ResponseStatusException(
@@ -176,6 +211,12 @@ public class BookingService {
         booking.setBookingReference(bookingReference);
         booking.setTurfId(turf.getId());
         booking.setTurfName(turf.getName());
+
+        // Securely link customer ID if authenticated (never from untrusted request body)
+        if (authenticatedCustomerId != null && !authenticatedCustomerId.isBlank()) {
+            booking.setCustomerId(authenticatedCustomerId.trim());
+        }
+
         booking.setCustomerName(request.getCustomerName().trim());
         booking.setCustomerEmail(request.getCustomerEmail().trim());
         booking.setCustomerPhone(request.getCustomerPhone() != null ? request.getCustomerPhone().trim() : null);
@@ -185,7 +226,7 @@ public class BookingService {
         booking.setDurationHours(duration);
         booking.setHourlyRate(turf.getPricePerHour());
         booking.setTotalPrice(totalPrice);
-        booking.setStatus("CONFIRMED"); // Temporary guest checkout (Auth/Payment Phase will update)
+        booking.setStatus("CONFIRMED");
         booking.setSlotKeys(slotKeys);
         booking.setCreatedAt(Instant.now());
 
@@ -203,13 +244,146 @@ public class BookingService {
     }
 
     /**
-     * Looks up an existing booking by booking reference.
+     * Retrieves all bookings for the specified authenticated customer.
+     */
+    public List<BookingResponse> getMyBookings(String customerId) {
+        if (customerId == null || customerId.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required");
+        }
+        return bookingRepository.findByCustomerIdOrderByBookingDateDescStartTimeDesc(customerId)
+                .stream()
+                .map(BookingResponse::fromEntity)
+                .toList();
+    }
+
+    /**
+     * Looks up an existing booking by booking reference (public fallback without user context).
      */
     public BookingResponse getBookingByReference(String reference) {
+        return getBookingByReference(reference, null, false);
+    }
+
+    /**
+     * Looks up an existing booking by booking reference.
+     * Protects private booking details (customer email, phone, and customerId)
+     * if the requester is neither the booking owner nor an administrator.
+     */
+    public BookingResponse getBookingByReference(String reference, String requesterId, boolean isAdmin) {
         Booking booking = bookingRepository.findByBookingReference(reference)
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND, "Booking not found with reference: " + reference
                 ));
-        return BookingResponse.fromEntity(booking);
+
+        BookingResponse response = BookingResponse.fromEntity(booking);
+
+        boolean isOwner = requesterId != null && booking.getCustomerId() != null
+                && requesterId.equals(booking.getCustomerId());
+
+        if (!isOwner && !isAdmin) {
+            response.setCustomerEmail(maskEmail(booking.getCustomerEmail()));
+            response.setCustomerPhone(maskPhone(booking.getCustomerPhone()));
+            response.setCustomerId(null);
+        }
+
+        return response;
+    }
+
+    /**
+     * Cancels an existing booking subject to server-side authorization and cancellation rules.
+     *
+     * Rules:
+     * 1. Only the customer who owns the booking or an administrator can cancel it.
+     * 2. Guest bookings cannot be cancelled by unrelated authenticated customer accounts.
+     * 3. A booking cannot be cancelled after its scheduled start time.
+     * 4. A booking that is already cancelled cannot be cancelled again.
+     * 5. Atomically transitions status to CANCELLED and sets cancelledAt, safely releasing
+     *    the reserved slots at the MongoDB storage engine level via the partial unique index.
+     */
+    public BookingResponse cancelBooking(String reference, UserPrincipal principal) {
+        if (principal == null || principal.getId() == null) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required to cancel a booking");
+        }
+
+        Booking booking = bookingRepository.findByBookingReference(reference)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Booking not found with reference: " + reference
+                ));
+
+        boolean isAdmin = principal.getRole() != null && principal.getRole().equalsIgnoreCase("ADMIN");
+
+        // Guest booking check
+        if (booking.getCustomerId() == null) {
+            if (!isAdmin) {
+                throw new ResponseStatusException(
+                        HttpStatus.FORBIDDEN,
+                        "Guest reservations cannot be cancelled by customer accounts. Please contact turf management."
+                );
+            }
+        } else if (!isAdmin && !principal.getId().equals(booking.getCustomerId())) {
+            // Customer mismatch check
+            throw new ResponseStatusException(
+                    HttpStatus.FORBIDDEN,
+                    "You are not authorized to cancel this booking."
+            );
+        }
+
+        // Check if already cancelled
+        if ("CANCELLED".equalsIgnoreCase(booking.getStatus())) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Booking is already cancelled."
+            );
+        }
+
+        // Check start time against current local date and time
+        LocalDateTime bookingStartDateTime = LocalDateTime.of(booking.getBookingDate(), booking.getStartTime());
+        LocalDateTime now = LocalDateTime.now();
+        if (!bookingStartDateTime.isAfter(now)) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "A booking cannot be cancelled after its start time."
+            );
+        }
+
+        // Perform atomic conditional update: only if currently CONFIRMED
+        Query query = new Query(Criteria.where("bookingReference").is(reference).and("status").is("CONFIRMED"));
+        Update update = new Update()
+                .set("status", "CANCELLED")
+                .set("cancelledAt", Instant.now());
+
+        Booking updated = mongoTemplate.findAndModify(
+                query,
+                update,
+                FindAndModifyOptions.options().returnNew(true),
+                Booking.class
+        );
+
+        if (updated == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Booking is already cancelled."
+            );
+        }
+
+        log.info("Booking {} successfully cancelled by user {}", reference, principal.getId());
+        return BookingResponse.fromEntity(updated);
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || email.isBlank()) return null;
+        int atIndex = email.indexOf('@');
+        if (atIndex <= 1) return "***" + (atIndex >= 0 ? email.substring(atIndex) : "");
+        String namePart = email.substring(0, atIndex);
+        String domainPart = email.substring(atIndex);
+        if (namePart.length() <= 2) {
+            return namePart.charAt(0) + "***" + domainPart;
+        }
+        return namePart.charAt(0) + "***" + namePart.charAt(namePart.length() - 1) + domainPart;
+    }
+
+    private String maskPhone(String phone) {
+        if (phone == null || phone.isBlank()) return null;
+        if (phone.length() <= 4) return "****";
+        return "*".repeat(phone.length() - 4) + phone.substring(phone.length() - 4);
     }
 }

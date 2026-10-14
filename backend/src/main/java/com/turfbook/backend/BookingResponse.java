@@ -12,6 +12,7 @@ public class BookingResponse {
     private String bookingReference;
     private String turfId;
     private String turfName;
+    private String customerId;
     private String customerName;
     private String customerEmail;
     private String customerPhone;
@@ -30,6 +31,7 @@ public class BookingResponse {
     private double totalPrice;
     private String status;
     private Instant createdAt;
+    private Instant cancelledAt;
 
     public BookingResponse() {
     }
@@ -40,6 +42,7 @@ public class BookingResponse {
         res.setBookingReference(booking.getBookingReference());
         res.setTurfId(booking.getTurfId());
         res.setTurfName(booking.getTurfName());
+        res.setCustomerId(booking.getCustomerId());
         res.setCustomerName(booking.getCustomerName());
         res.setCustomerEmail(booking.getCustomerEmail());
         res.setCustomerPhone(booking.getCustomerPhone());
@@ -51,6 +54,7 @@ public class BookingResponse {
         res.setTotalPrice(booking.getTotalPrice());
         res.setStatus(booking.getStatus());
         res.setCreatedAt(booking.getCreatedAt());
+        res.setCancelledAt(booking.getCancelledAt());
         return res;
     }
 
@@ -166,11 +170,27 @@ public class BookingResponse {
         this.status = status;
     }
 
+    public String getCustomerId() {
+        return customerId;
+    }
+
+    public void setCustomerId(String customerId) {
+        this.customerId = customerId;
+    }
+
     public Instant getCreatedAt() {
         return createdAt;
     }
 
     public void setCreatedAt(Instant createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public Instant getCancelledAt() {
+        return cancelledAt;
+    }
+
+    public void setCancelledAt(Instant cancelledAt) {
+        this.cancelledAt = cancelledAt;
     }
 }

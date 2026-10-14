@@ -32,7 +32,10 @@ public class Booking {
     private String turfId;
     private String turfName;
 
-    // Guest checkout details (Authentication Phase: will link to User ID)
+    // Linked customer ID (null for guest checkout, populated for authenticated customers)
+    @Indexed
+    private String customerId;
+
     private String customerName;
     private String customerEmail;
     private String customerPhone;
@@ -60,6 +63,7 @@ public class Booking {
     private List<String> slotKeys = new ArrayList<>();
 
     private Instant createdAt;
+    private Instant cancelledAt;
 
     public Booking() {
     }
@@ -206,11 +210,27 @@ public class Booking {
         this.slotKeys = slotKeys;
     }
 
+    public String getCustomerId() {
+        return customerId;
+    }
+
+    public void setCustomerId(String customerId) {
+        this.customerId = customerId;
+    }
+
     public Instant getCreatedAt() {
         return createdAt;
     }
 
     public void setCreatedAt(Instant createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public Instant getCancelledAt() {
+        return cancelledAt;
+    }
+
+    public void setCancelledAt(Instant cancelledAt) {
+        this.cancelledAt = cancelledAt;
     }
 }

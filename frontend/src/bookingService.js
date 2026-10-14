@@ -33,3 +33,25 @@ export const getBookingByReference = async (reference) => {
   const response = await api.get(`/api/bookings/${reference}`);
   return response.data;
 };
+
+/**
+ * Retrieves all bookings belonging to the currently authenticated customer.
+ * Calls protected GET /api/bookings/my
+ * @returns {Promise<Array<Object>>}
+ */
+export const getMyBookings = async () => {
+  const response = await api.get("/api/bookings/my");
+  return response.data;
+};
+
+/**
+ * Cancels an eligible booking reservation.
+ * Calls protected PATCH /api/bookings/{reference}/cancel
+ * @param {string} reference
+ * @returns {Promise<Object>}
+ */
+export const cancelBooking = async (reference) => {
+  const response = await api.patch(`/api/bookings/${reference}/cancel`);
+  return response.data;
+};
+

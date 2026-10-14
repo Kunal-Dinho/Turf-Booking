@@ -8,10 +8,23 @@ import {
   Calendar,
   Clock,
   CheckCircle2,
-  AlertCircle
+  AlertCircle,
+  User,
+  LogOut,
+  BookmarkCheck,
+  XCircle,
+  AlertTriangle
 } from "lucide-react";
 import ApiStatusBadge from "./components/ApiStatusBadge";
-import { getAvailability, createBooking } from "./bookingService";
+import { getAvailability, createBooking, getMyBookings, cancelBooking } from "./bookingService";
+import {
+  register as registerCustomer,
+  login as loginCustomer,
+  logout as logoutCustomer,
+  getStoredUser,
+  getStoredToken,
+  getCurrentUser
+} from "./authService";
 import "./App.css";
 
 const TIME_SLOTS = [
@@ -39,18 +52,51 @@ function App() {
   const [turfsLoading, setTurfsLoading] = useState(true);
   const [turfsError, setTurfsError] = useState("");
 
+  // Customer session & authentication states
+  const [currentUser, setCurrentUser] = useState(getStoredUser);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authMode, setAuthMode] = useState("login"); // 'login' | 'register'
+  const [authName, setAuthName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState("");
+
+  // My Bookings modal states
+  const [myBookingsOpen, setMyBookingsOpen] = useState(false);
+  const [myBookings, setMyBookings] = useState([]);
+  const [myBookingsLoading, setMyBookingsLoading] = useState(false);
+  const [myBookingsError, setMyBookingsError] = useState("");
+  const [cancellingBooking, setCancellingBooking] = useState(null);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState("");
+  const [cancelSuccess, setCancelSuccess] = useState("");
+
   // Booking modal and form states
   const [modalStep, setModalStep] = useState("details"); // 'details' | 'form' | 'success'
   const [bookingDate, setBookingDate] = useState(getTomorrowString);
   const [bookingTime, setBookingTime] = useState("18:00");
   const [durationHours, setDurationHours] = useState(1);
-  const [customerName, setCustomerName] = useState("");
-  const [customerEmail, setCustomerEmail] = useState("");
+  const [customerName, setCustomerName] = useState(() => getStoredUser()?.name || "");
+  const [customerEmail, setCustomerEmail] = useState(() => getStoredUser()?.email || "");
   const [customerPhone, setCustomerPhone] = useState("");
   const [bookedSlots, setBookedSlots] = useState([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [bookingError, setBookingError] = useState("");
   const [confirmedBooking, setConfirmedBooking] = useState(null);
+
+  // Restore & verify authenticated session on mount
+  useEffect(() => {
+    if (getStoredToken()) {
+      getCurrentUser()
+        .then((user) => {
+          setCurrentUser(user);
+        })
+        .catch(() => {
+          setCurrentUser(null);
+        });
+    }
+  }, []);
 
   const filteredTurfs = turfs.filter((turf) => {
     const matchesSearch =
@@ -105,6 +151,10 @@ function App() {
     setSelectedTurf(turf);
     setModalStep("details");
     setBookingError("");
+    if (currentUser) {
+      if (!customerName) setCustomerName(currentUser.name || "");
+      if (!customerEmail) setCustomerEmail(currentUser.email || "");
+    }
   };
 
   const handleCloseModal = () => {
@@ -112,6 +162,136 @@ function App() {
     setModalStep("details");
     setBookingError("");
     setConfirmedBooking(null);
+  };
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setAuthSubmitting(true);
+    setAuthError("");
+
+    try {
+      let data;
+      if (authMode === "register") {
+        data = await registerCustomer(authName.trim(), authEmail.trim(), authPassword);
+      } else {
+        data = await loginCustomer(authEmail.trim(), authPassword);
+      }
+      const user = { id: data.id, name: data.name, email: data.email };
+      setCurrentUser(user);
+      setAuthModalOpen(false);
+      setAuthPassword("");
+      // Sync form fields with authenticated customer details
+      setCustomerName(user.name);
+      setCustomerEmail(user.email);
+    } catch (err) {
+      const errorMsg =
+        err.response?.data?.message ||
+        err.response?.data?.error ||
+        err.message ||
+        "Authentication failed. Please verify your credentials.";
+      setAuthError(errorMsg);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = () => {
+    logoutCustomer();
+    setCurrentUser(null);
+    setMyBookingsOpen(false);
+    setMyBookings([]);
+    setCancellingBooking(null);
+    setCancelError("");
+    setCancelSuccess("");
+  };
+
+  const handleOpenMyBookings = async () => {
+    setMyBookingsOpen(true);
+    setMyBookingsLoading(true);
+    setMyBookingsError("");
+    setCancelError("");
+    setCancelSuccess("");
+    try {
+      const data = await getMyBookings();
+      setMyBookings(data);
+    } catch (err) {
+      if (err.response?.status === 401) {
+        handleLogout();
+        setAuthError("Your session has expired. Please sign in again.");
+        setAuthModalOpen(true);
+        return;
+      }
+      const errorMsg =
+        err.response?.data?.message ||
+        err.message ||
+        "Failed to load your reservations. Please try again.";
+      setMyBookingsError(errorMsg);
+    } finally {
+      setMyBookingsLoading(false);
+    }
+  };
+
+  const isBookingCancellable = (booking) => {
+    if (!booking || booking.status !== "CONFIRMED") return false;
+    try {
+      if (!booking.bookingDate || !booking.startTime) return false;
+      const [year, month, day] = booking.bookingDate.split("-").map(Number);
+      const [hour, minute] = booking.startTime.split(":").map(Number);
+      const bookingStart = new Date(year, month - 1, day, hour, minute);
+      return bookingStart > new Date();
+    } catch {
+      return false;
+    }
+  };
+
+  const handleInitiateCancel = (booking) => {
+    setCancelError("");
+    setCancelSuccess("");
+    setCancellingBooking(booking);
+  };
+
+  const handleConfirmCancel = async () => {
+    if (!cancellingBooking) return;
+    setIsCancelling(true);
+    setCancelError("");
+    try {
+      const updated = await cancelBooking(cancellingBooking.bookingReference);
+      setCancelSuccess(`Reservation ${updated.bookingReference} was cancelled successfully. The reserved slot has been released.`);
+      setCancellingBooking(null);
+
+      // Reflect cancelled status immediately in local list
+      setMyBookings((prev) =>
+        prev.map((b) =>
+          b.bookingReference === updated.bookingReference
+            ? { ...b, status: "CANCELLED", cancelledAt: updated.cancelledAt }
+            : b
+        )
+      );
+
+      // Re-fetch availability if turf booking modal is active
+      if (selectedTurf) {
+        getAvailability(selectedTurf.id, bookingDate)
+          .then((data) => setBookedSlots(data.bookedSlots || []))
+          .catch((err) => console.error("Availability refresh failed:", err));
+      }
+    } catch (err) {
+      if (err.response?.status === 401) {
+        handleLogout();
+        setAuthError("Your session has expired. Please sign in again.");
+        setAuthModalOpen(true);
+        setMyBookingsOpen(false);
+        setCancellingBooking(null);
+      } else {
+        const errorMsg =
+          err.response?.data?.message ||
+          err.response?.data?.error ||
+          err.message ||
+          "Failed to cancel booking. Please try again.";
+        setCancelError(errorMsg);
+      }
+    } finally {
+      setIsCancelling(false);
+    }
   };
 
   const handleBookingSubmit = async (e) => {
@@ -161,14 +341,41 @@ function App() {
 
         <div className="navbar-actions">
           <ApiStatusBadge />
-          <button
-            className="login-button"
-            onClick={() =>
-              alert("Login will be implemented in a later phase.")
-            }
-          >
-            Sign in
-          </button>
+          {currentUser ? (
+            <div className="user-nav-group">
+              <button
+                className="my-bookings-btn"
+                onClick={handleOpenMyBookings}
+                aria-label="View my bookings"
+              >
+                <BookmarkCheck size={16} />
+                <span>My Bookings</span>
+              </button>
+              <div className="user-profile-badge" title={currentUser.email}>
+                <User size={15} />
+                <span className="user-name">{currentUser.name.split(" ")[0]}</span>
+              </div>
+              <button
+                className="logout-button"
+                onClick={handleLogout}
+                aria-label="Sign out"
+                title="Sign out"
+              >
+                <LogOut size={16} />
+              </button>
+            </div>
+          ) : (
+            <button
+              className="login-button"
+              onClick={() => {
+                setAuthMode("login");
+                setAuthError("");
+                setAuthModalOpen(true);
+              }}
+            >
+              Sign in
+            </button>
+          )}
         </div>
       </header>
 
@@ -261,11 +468,10 @@ function App() {
                 {filteredTurfs.map((turf) => (
                   <article className="turf-card" key={turf.id}>
                     <div
-                      className={`turf-image ${
-                        turf.sport?.toLowerCase() === "cricket"
+                      className={`turf-image ${turf.sport?.toLowerCase() === "cricket"
                           ? "orange"
                           : "blue"
-                      }`}
+                        }`}
                     >
                       <span className="sport-emoji">
                         {turf.sport?.toLowerCase() === "cricket"
@@ -529,7 +735,11 @@ function App() {
                 </div>
 
                 <div className="guest-booking-notice">
-                  ℹ️ Guest checkout mode. Payment gateway and account synchronization will be enabled in upcoming phases.
+                  {currentUser ? (
+                    `ℹ️ Authenticated as ${currentUser.name}. This reservation will automatically be linked to your account.`
+                  ) : (
+                    "ℹ️ Guest checkout mode. Sign in to link your reservations to your personal account."
+                  )}
                 </div>
 
                 <button
@@ -591,16 +801,342 @@ function App() {
                 </div>
 
                 <p className="success-guest-note">
-                  Your reservation is confirmed under status <strong>{confirmedBooking.status}</strong>.
+                  {currentUser ? (
+                    <>
+                      Linked to your account (<strong>{currentUser.email}</strong>). View all your reservations in <strong>My Bookings</strong>.
+                    </>
+                  ) : (
+                    <>
+                      Your reservation is confirmed under status <strong>{confirmedBooking.status}</strong>. Keep your booking reference handy!
+                    </>
+                  )}
                 </p>
 
-                <button
-                  type="button"
-                  className="booking-button"
-                  onClick={handleCloseModal}
+                <div className="form-group-row">
+                  {currentUser && (
+                    <button
+                      type="button"
+                      className="modal-back-btn"
+                      style={{ justifyContent: "center", padding: "12px", width: "100%" }}
+                      onClick={() => {
+                        handleCloseModal();
+                        handleOpenMyBookings();
+                      }}
+                    >
+                      <BookmarkCheck size={16} /> View My Bookings
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="booking-button"
+                    style={{ marginTop: 0 }}
+                    onClick={handleCloseModal}
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* Auth Modal: Sign In / Create Account */}
+      {authModalOpen && (
+        <div className="turf-modal-backdrop" onClick={() => setAuthModalOpen(false)}>
+          <section
+            className="turf-modal auth-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              onClick={() => setAuthModalOpen(false)}
+              aria-label="Close modal"
+            >
+              ×
+            </button>
+
+            <div className="auth-tabs">
+              <button
+                type="button"
+                className={`auth-tab ${authMode === "login" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthError("");
+                }}
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                className={`auth-tab ${authMode === "register" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("register");
+                  setAuthError("");
+                }}
+              >
+                Create Account
+              </button>
+            </div>
+
+            <h2 id="auth-modal-title">
+              {authMode === "login" ? "Welcome back" : "Create your account"}
+            </h2>
+            <p className="auth-modal-sub">
+              {authMode === "login"
+                ? "Sign in to access your bookings and reserve turfs quickly."
+                : "Register with TurfBook to manage and view all your reservations."}
+            </p>
+
+            {authError && (
+              <div className="booking-alert-error" role="alert">
+                <AlertCircle size={18} />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleAuthSubmit} className="booking-form auth-form">
+              {authMode === "register" && (
+                <div className="form-group">
+                  <label htmlFor="auth-name">Full Name</label>
+                  <input
+                    id="auth-name"
+                    type="text"
+                    placeholder="e.g. Alex Hunter"
+                    value={authName}
+                    onChange={(e) => setAuthName(e.target.value)}
+                    required
+                  />
+                </div>
+              )}
+
+              <div className="form-group">
+                <label htmlFor="auth-email">Email Address</label>
+                <input
+                  id="auth-email"
+                  type="email"
+                  placeholder="alex@example.com"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="auth-password">Password</label>
+                <input
+                  id="auth-password"
+                  type="password"
+                  placeholder={authMode === "register" ? "Minimum 6 characters" : "••••••••"}
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  minLength={authMode === "register" ? 6 : undefined}
+                  required
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="booking-button auth-submit-btn"
+                disabled={authSubmitting}
+              >
+                {authSubmitting ? (
+                  "Processing..."
+                ) : authMode === "login" ? (
+                  <>
+                    Sign In
+                    <ArrowRight size={18} />
+                  </>
+                ) : (
+                  <>
+                    Create Account
+                    <ArrowRight size={18} />
+                  </>
+                )}
+              </button>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {/* My Bookings Modal: Protected Customer Reservations */}
+      {myBookingsOpen && (
+        <div className="turf-modal-backdrop" onClick={() => setMyBookingsOpen(false)}>
+          <section
+            className="turf-modal booking-modal-wide my-bookings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="my-bookings-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              onClick={() => setMyBookingsOpen(false)}
+              aria-label="Close modal"
+            >
+              ×
+            </button>
+
+            <span className="eyebrow">CUSTOMER PORTAL</span>
+            <h2 id="my-bookings-title">My Bookings</h2>
+            <p className="booking-modal-sub">
+              Your confirmed ground reservations for <strong>{currentUser?.name}</strong>
+            </p>
+
+            {myBookingsLoading && (
+              <p className="empty-state">Loading your reservations...</p>
+            )}
+
+            {cancelSuccess && (
+              <div className="booking-alert-success" role="status">
+                <CheckCircle2 size={18} />
+                <span>{cancelSuccess}</span>
+              </div>
+            )}
+
+            {myBookingsError && (
+              <div className="booking-alert-error" role="alert">
+                <AlertCircle size={18} />
+                <span>{myBookingsError}</span>
+              </div>
+            )}
+
+            {!myBookingsLoading && !myBookingsError && (
+              <>
+                {myBookings.length === 0 ? (
+                  <div className="my-bookings-empty">
+                    <p className="empty-state">
+                      No reservations found for your account yet.
+                    </p>
+                    <button
+                      className="booking-button"
+                      onClick={() => {
+                        setMyBookingsOpen(false);
+                        document.getElementById("turfs")?.scrollIntoView({ behavior: "smooth" });
+                      }}
+                    >
+                      Explore Turfs Now
+                    </button>
+                  </div>
+                ) : (
+                  <div className="my-bookings-list">
+                    {myBookings.map((b) => (
+                      <article className={`my-booking-card ${b.status?.toLowerCase()}`} key={b.id || b.bookingReference}>
+                        <div className="my-booking-header">
+                          <div>
+                            <h4>{b.turfName}</h4>
+                            <span className="booking-ref-tag">{b.bookingReference}</span>
+                          </div>
+                          <span className={`status-pill ${b.status?.toLowerCase()}`}>
+                            {b.status}
+                          </span>
+                        </div>
+
+                        <div className="my-booking-details">
+                          <p>
+                            <Calendar size={14} />
+                            <span>{b.bookingDate}</span>
+                          </p>
+                          <p>
+                            <Clock size={14} />
+                            <span>{b.startTime} – {b.endTime} ({b.durationHours} hr{b.durationHours > 1 ? "s" : ""})</span>
+                          </p>
+                          <p className="my-booking-price">
+                            Total: <strong>₹{Number(b.totalPrice).toLocaleString("en-IN")}</strong>
+                          </p>
+                        </div>
+
+                        <div className="my-booking-footer">
+                          {isBookingCancellable(b) ? (
+                            <button
+                              type="button"
+                              className="cancel-booking-btn"
+                              onClick={() => handleInitiateCancel(b)}
+                              aria-label={`Cancel reservation ${b.bookingReference}`}
+                            >
+                              <XCircle size={14} />
+                              <span>Cancel Reservation</span>
+                            </button>
+                          ) : b.status === "CONFIRMED" ? (
+                            <span className="booking-status-note past">
+                              Past start time (Cancellation closed)
+                            </span>
+                          ) : (
+                            <span className="booking-status-note cancelled">
+                              Cancelled · Slot released
+                            </span>
+                          )}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* Cancellation Confirmation Dialog Overlay */}
+            {cancellingBooking && (
+              <div
+                className="cancel-confirm-backdrop"
+                onClick={() => !isCancelling && setCancellingBooking(null)}
+              >
+                <div
+                  className="cancel-confirm-modal"
+                  role="alertdialog"
+                  aria-modal="true"
+                  aria-labelledby="cancel-confirm-title"
+                  onClick={(e) => e.stopPropagation()}
                 >
-                  Done
-                </button>
+                  <div className="cancel-confirm-header">
+                    <AlertTriangle size={24} className="cancel-icon-warning" />
+                    <div>
+                      <h3 id="cancel-confirm-title">Cancel Reservation?</h3>
+                      <span className="cancel-ref-sub">Ref: {cancellingBooking.bookingReference}</span>
+                    </div>
+                  </div>
+
+                  <div className="cancel-confirm-body">
+                    <p>
+                      Are you sure you want to cancel your reservation for <strong>{cancellingBooking.turfName}</strong> on <strong>{cancellingBooking.bookingDate}</strong> from <strong>{cancellingBooking.startTime} to {cancellingBooking.endTime}</strong>?
+                    </p>
+
+                    <div className="cancellation-policy-box">
+                      <span className="policy-badge">Cancellation Policy</span>
+                      <p>
+                        Bookings can only be cancelled prior to scheduled start time. Upon cancellation, your reserved slot is immediately released and made available for other players.
+                      </p>
+                    </div>
+
+                    {cancelError && (
+                      <div className="booking-alert-error" role="alert">
+                        <AlertCircle size={16} />
+                        <span>{cancelError}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="cancel-confirm-footer">
+                    <button
+                      type="button"
+                      className="keep-booking-btn"
+                      onClick={() => setCancellingBooking(null)}
+                      disabled={isCancelling}
+                    >
+                      Keep Reservation
+                    </button>
+                    <button
+                      type="button"
+                      className="confirm-cancel-btn"
+                      onClick={handleConfirmCancel}
+                      disabled={isCancelling}
+                    >
+                      {isCancelling ? "Cancelling..." : "Yes, Cancel Booking"}
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
           </section>
