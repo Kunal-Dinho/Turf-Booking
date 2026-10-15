@@ -62,6 +62,9 @@ public class SecurityConfig {
                 // Booking creation: public for guest bookings, while authenticated users are automatically linked
                 .requestMatchers(HttpMethod.POST, "/api/bookings").permitAll()
 
+                // Razorpay Payment endpoints: config, signature verification, webhooks, dismissal
+                .requestMatchers("/api/payments/**").permitAll()
+
                 // Health & DB checks
                 .requestMatchers("/api/health", "/api/db-check").permitAll()
 

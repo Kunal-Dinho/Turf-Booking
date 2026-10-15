@@ -1,7 +1,10 @@
 package com.turfbook.backend;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.dao.DuplicateKeyException;
@@ -16,9 +19,11 @@ import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.http.HttpStatus;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -37,49 +42,86 @@ public class BookingService {
     private final BookingRepository bookingRepository;
     private final TurfRepository turfRepository;
     private final MongoTemplate mongoTemplate;
+    private final RazorpayService razorpayService;
+    private final ObjectMapper objectMapper;
 
     public BookingService(BookingRepository bookingRepository,
                           TurfRepository turfRepository,
                           MongoTemplate mongoTemplate) {
+        this(bookingRepository, turfRepository, mongoTemplate, null, new ObjectMapper());
+    }
+
+    @Autowired
+    public BookingService(BookingRepository bookingRepository,
+                          TurfRepository turfRepository,
+                          MongoTemplate mongoTemplate,
+                          RazorpayService razorpayService,
+                          ObjectMapper objectMapper) {
         this.bookingRepository = bookingRepository;
         this.turfRepository = turfRepository;
         this.mongoTemplate = mongoTemplate;
+        this.razorpayService = razorpayService;
+        this.objectMapper = objectMapper != null ? objectMapper : new ObjectMapper();
     }
 
     /**
      * Programmatically ensures database indexes exist in MongoDB Atlas.
-     * Uses a partial unique index on `slotKeys` filtering on status="CONFIRMED"
-     * so that cancelled bookings automatically release their time slots at the storage level.
+     * Uses a partial unique index on `slotKeys` filtering on slotLocked=true
+     * so that pending reservations and confirmed bookings prevent double booking,
+     * while cancelled or expired bookings automatically release their time slots.
      */
     @EventListener(ApplicationReadyEvent.class)
     public void ensureIndexes() {
         try {
+            // 1. Data Backfill: Ensure existing documents have the slotLocked field
+            mongoTemplate.updateMulti(
+                    new Query(Criteria.where("status").is("CONFIRMED").and("slotLocked").exists(false)),
+                    new Update().set("slotLocked", true),
+                    Booking.class
+            );
+            mongoTemplate.updateMulti(
+                    new Query(Criteria.where("status").ne("CONFIRMED").and("slotLocked").exists(false)),
+                    new Update().set("slotLocked", false),
+                    Booking.class
+            );
+
             IndexOperations indexOps = mongoTemplate.indexOps(Booking.class);
             List<IndexInfo> indexInfoList = indexOps.getIndexInfo();
+
+            // 2. Safe index migration: if legacy index on status=CONFIRMED exists, drop it
             for (IndexInfo info : indexInfoList) {
-                if ("slotKeys_1".equals(info.getName()) || "slotKeys".equals(info.getName())) {
+                if ("slotKeys_1".equals(info.getName()) || "slotKeys".equals(info.getName()) || info.getName().startsWith("slotKeys")) {
                     String partialFilter = info.getPartialFilterExpression();
-                    if (partialFilter == null || !partialFilter.contains("CONFIRMED")) {
-                        log.info("Migrating legacy slotKeys index to partial unique index (status=CONFIRMED)...");
-                        indexOps.dropIndex(info.getName());
-                        break;
+                    if (partialFilter == null || !partialFilter.contains("slotLocked")) {
+                        log.info("Migrating legacy slotKeys index '{}' to partial unique index (slotLocked=true)...", info.getName());
+                        try {
+                            indexOps.dropIndex(info.getName());
+                        } catch (Exception dropEx) {
+                            log.warn("Could not drop legacy index '{}': {}", info.getName(), dropEx.getMessage());
+                        }
                     }
                 }
             }
 
+            // 3. Ensure the new partial unique index on slotLocked=true
             indexOps.ensureIndex(
                 new Index()
                     .on("slotKeys", Sort.Direction.ASC)
                     .unique()
-                    .partial(PartialIndexFilter.of(Criteria.where("status").is("CONFIRMED")))
+                    .partial(PartialIndexFilter.of(Criteria.where("slotLocked").is(true)))
+                    .named("slotKeys_slotLocked_unique")
             );
+
             indexOps.ensureIndex(
                 new Index().on("bookingReference", Sort.Direction.ASC).unique()
             );
             indexOps.ensureIndex(
+                new Index().on("razorpayOrderId", Sort.Direction.ASC)
+            );
+            indexOps.ensureIndex(
                 new Index().on("customerId", Sort.Direction.ASC).on("bookingDate", Sort.Direction.DESC).on("startTime", Sort.Direction.DESC)
             );
-            log.info("Booking unique indices initialized successfully.");
+            log.info("Booking unique indices initialized successfully with slotLocked partial filter.");
         } catch (Exception e) {
             log.warn("Notice: could not ensure MongoDB indices (or already exist): {}", e.getMessage());
         }
@@ -87,17 +129,31 @@ public class BookingService {
 
     /**
      * Retrieves already booked time slots for a specific turf and date.
+     * Excludes expired pending reservations.
      */
     public AvailabilityResponse getAvailability(String turfId, LocalDate date) {
         if (!turfRepository.existsById(turfId)) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Turf not found with id: " + turfId);
         }
 
-        List<Booking> confirmedBookings = bookingRepository
-                .findByTurfIdAndBookingDateAndStatus(turfId, date, "CONFIRMED");
+        // Clean expired reservations lazily
+        cleanExpiredReservationsInternal();
+
+        List<Booking> activeBookings = bookingRepository
+                .findByTurfIdAndBookingDateAndSlotLockedTrue(turfId, date);
+        if (activeBookings == null || activeBookings.isEmpty()) {
+            activeBookings = bookingRepository.findByTurfIdAndBookingDateAndStatus(turfId, date, "CONFIRMED");
+        }
+        if (activeBookings == null) {
+            activeBookings = Collections.emptyList();
+        }
 
         Set<String> bookedSlotSet = new TreeSet<>();
-        for (Booking b : confirmedBookings) {
+        for (Booking b : activeBookings) {
+            // Filter out any booking that may have expired in the current millisecond
+            if ("PENDING_PAYMENT".equalsIgnoreCase(b.getStatus()) && b.getExpiresAt() != null && b.getExpiresAt().isBefore(Instant.now())) {
+                continue;
+            }
             LocalTime cur = b.getStartTime();
             LocalTime end = b.getEndTime();
             while (cur.isBefore(end)) {
@@ -123,7 +179,8 @@ public class BookingService {
     }
 
     /**
-     * Creates a new booking reservation with authenticated customer linkage.
+     * Creates a new booking reservation with authenticated customer linkage and Razorpay order.
+     * Transitions slot to PENDING_PAYMENT with an active slotLock for 10 minutes.
      */
     public BookingResponse createBooking(BookingRequest request, String authenticatedCustomerId) {
         // 1. Fetch turf to verify existence and get authoritative price per hour
@@ -191,8 +248,15 @@ public class BookingService {
             slotKeys.add(key);
         }
 
+        // Clean expired bookings before pre-check
+        cleanExpiredReservationsInternal();
+
         // 5. Pre-check overlap in database
-        if (bookingRepository.existsBySlotKeysInAndStatus(slotKeys, "CONFIRMED")) {
+        boolean slotTaken = bookingRepository.existsBySlotKeysInAndSlotLockedTrue(slotKeys);
+        if (!slotTaken) {
+            slotTaken = bookingRepository.existsBySlotKeysInAndStatus(slotKeys, "CONFIRMED");
+        }
+        if (slotTaken) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT, "One or more of the selected time slots are already booked."
             );
@@ -206,7 +270,18 @@ public class BookingService {
         String randomPart = UUID.randomUUID().toString().replace("-", "").substring(0, 4).toUpperCase();
         String bookingReference = "TB-" + datePart + "-" + randomPart;
 
-        // 8. Construct booking entity
+        // 8. Create Razorpay Order
+        String orderId;
+        int windowMinutes = 10;
+        if (razorpayService != null) {
+            RazorpayService.RazorpayOrderResult order = razorpayService.createOrder(bookingReference, totalPrice);
+            orderId = order != null ? order.orderId() : "order_sim_" + UUID.randomUUID().toString().replace("-", "").substring(0, 14);
+            windowMinutes = razorpayService.getPaymentWindowMinutes();
+        } else {
+            orderId = "order_sim_" + UUID.randomUUID().toString().replace("-", "").substring(0, 14);
+        }
+
+        // 9. Construct booking entity
         Booking booking = new Booking();
         booking.setBookingReference(bookingReference);
         booking.setTurfId(turf.getId());
@@ -226,20 +301,257 @@ public class BookingService {
         booking.setDurationHours(duration);
         booking.setHourlyRate(turf.getPricePerHour());
         booking.setTotalPrice(totalPrice);
-        booking.setStatus("CONFIRMED");
+
+        // Payment lifecycle initialization: slot is locked during payment window
+        booking.setStatus("PENDING_PAYMENT");
+        booking.setPaymentStatus("CREATED");
+        booking.setSlotLocked(true);
         booking.setSlotKeys(slotKeys);
+        booking.setRazorpayOrderId(orderId);
+        booking.setExpiresAt(Instant.now().plus(Duration.ofMinutes(windowMinutes)));
         booking.setCreatedAt(Instant.now());
 
-        // 9. Persist with atomic concurrency protection
+        // 10. Persist with atomic concurrency protection
         try {
             Booking saved = bookingRepository.save(booking);
-            return BookingResponse.fromEntity(saved);
+            return enrichResponse(BookingResponse.fromEntity(saved));
         } catch (DuplicateKeyException dke) {
             log.warn("Concurrent booking collision detected for slotKeys: {}", slotKeys);
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
                     "This time slot was just booked by another user. Please select a different time slot."
             );
+        }
+    }
+
+    /**
+     * Verifies payment signature and confirms booking.
+     * Enforces that client callbacks alone cannot confirm a booking without valid HMAC signature.
+     */
+    public BookingResponse verifyPayment(PaymentVerificationRequest request, UserPrincipal principal) {
+        Booking booking = bookingRepository.findByBookingReference(request.getBookingReference())
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Booking not found with reference: " + request.getBookingReference()
+                ));
+
+        // Order association verification
+        if (booking.getRazorpayOrderId() == null || !booking.getRazorpayOrderId().equals(request.getRazorpayOrderId())) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Razorpay order ID does not match booking reservation"
+            );
+        }
+
+        // Customer ownership verification (for authenticated bookings)
+        if (booking.getCustomerId() != null && principal != null && !"ADMIN".equalsIgnoreCase(principal.getRole())) {
+            if (!principal.getId().equals(booking.getCustomerId())) {
+                throw new ResponseStatusException(
+                        HttpStatus.FORBIDDEN, "You are not authorized to verify this booking payment"
+                );
+            }
+        }
+
+        // Idempotency: if already confirmed with matching payment ID, return existing confirmed booking
+        if ("CONFIRMED".equalsIgnoreCase(booking.getStatus()) && "SUCCESS".equalsIgnoreCase(booking.getPaymentStatus())) {
+            if (request.getRazorpayPaymentId().equals(booking.getRazorpayPaymentId())) {
+                log.info("Idempotent payment verification received for confirmed booking {}", booking.getBookingReference());
+                return enrichResponse(BookingResponse.fromEntity(booking));
+            }
+        }
+
+        if ("CANCELLED".equalsIgnoreCase(booking.getStatus())) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Booking has already been cancelled"
+            );
+        }
+
+        // Check if reservation expired
+        Instant now = Instant.now();
+        if ("EXPIRED".equalsIgnoreCase(booking.getStatus()) ||
+                (booking.getExpiresAt() != null && booking.getExpiresAt().isBefore(now) && !"CONFIRMED".equalsIgnoreCase(booking.getStatus()))) {
+            // Attempt automatic refund if payment was already made
+            try {
+                razorpayService.createRefund(request.getRazorpayPaymentId(), booking.getTotalPrice());
+            } catch (Exception refEx) {
+                log.warn("Could not issue immediate refund for expired booking: {}", refEx.getMessage());
+            }
+            throw new ResponseStatusException(
+                    HttpStatus.GONE, "Reservation expired before payment could be confirmed. Slot has been released and any deduction will be refunded."
+            );
+        }
+
+        // Verify Razorpay HMAC signature
+        boolean validSignature = razorpayService.verifyPaymentSignature(
+                request.getRazorpayOrderId(),
+                request.getRazorpayPaymentId(),
+                request.getRazorpaySignature()
+        );
+
+        if (!validSignature) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Invalid payment signature"
+            );
+        }
+
+        // Perform atomic transition from PENDING_PAYMENT to CONFIRMED
+        Query query = new Query(Criteria.where("bookingReference").is(request.getBookingReference())
+                .and("status").is("PENDING_PAYMENT"));
+        Update update = new Update()
+                .set("status", "CONFIRMED")
+                .set("paymentStatus", "SUCCESS")
+                .set("razorpayPaymentId", request.getRazorpayPaymentId())
+                .set("razorpaySignature", request.getRazorpaySignature())
+                .set("confirmedAt", now)
+                .set("slotLocked", true);
+
+        Booking updated = mongoTemplate.findAndModify(
+                query,
+                update,
+                FindAndModifyOptions.options().returnNew(true),
+                Booking.class
+        );
+
+        if (updated == null) {
+            Booking latest = bookingRepository.findByBookingReference(request.getBookingReference())
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Booking not found"));
+            if ("CONFIRMED".equalsIgnoreCase(latest.getStatus())) {
+                return enrichResponse(BookingResponse.fromEntity(latest));
+            }
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT, "Could not confirm booking. Reservation was already finalized or expired."
+            );
+        }
+
+        log.info("Booking {} successfully verified and confirmed. Payment ID: {}", updated.getBookingReference(), request.getRazorpayPaymentId());
+        return enrichResponse(BookingResponse.fromEntity(updated));
+    }
+
+    /**
+     * Webhook handler for asynchronous Razorpay events.
+     * Uses raw-body signature verification with webhook secret.
+     */
+    public void handleWebhook(String rawPayload, String signatureHeader) {
+        if (signatureHeader == null || !razorpayService.verifyWebhookSignature(rawPayload, signatureHeader)) {
+            log.warn("Rejected Razorpay webhook: invalid signature");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid webhook signature");
+        }
+
+        try {
+            JsonNode root = objectMapper.readTree(rawPayload);
+            String event = root.path("event").asText("");
+            log.info("Processing verified Razorpay webhook event: {}", event);
+
+            if ("payment.captured".equals(event) || "order.paid".equals(event)) {
+                JsonNode paymentNode = root.path("payload").path("payment").path("entity");
+                String orderId = paymentNode.path("order_id").asText();
+                String paymentId = paymentNode.path("id").asText();
+                long amount = paymentNode.path("amount").asLong();
+
+                if (orderId.isBlank()) {
+                    orderId = root.path("payload").path("order").path("entity").path("id").asText();
+                }
+
+                Optional<Booking> opt = bookingRepository.findByRazorpayOrderId(orderId);
+                if (opt.isPresent()) {
+                    Booking b = opt.get();
+                    if ("CONFIRMED".equalsIgnoreCase(b.getStatus())) {
+                        log.info("Webhook duplicate ignored: booking {} is already CONFIRMED", b.getBookingReference());
+                        return;
+                    }
+
+                    // Handle late payment after expiration: release slot & initiate refund
+                    if (b.getExpiresAt() != null && b.getExpiresAt().isBefore(Instant.now())) {
+                        log.warn("Late payment received for expired booking {}. Initiating refund...", b.getBookingReference());
+                        razorpayService.createRefund(paymentId, b.getTotalPrice());
+                        b.setPaymentStatus("REFUND_INITIATED");
+                        bookingRepository.save(b);
+                        return;
+                    }
+
+                    // Verify expected amount in paise
+                    long expectedPaise = Math.round(b.getTotalPrice() * 100);
+                    if (amount > 0 && amount != expectedPaise) {
+                        log.error("Payment amount mismatch for order {}: expected {} paise, received {} paise", orderId, expectedPaise, amount);
+                        return;
+                    }
+
+                    b.setStatus("CONFIRMED");
+                    b.setPaymentStatus("SUCCESS");
+                    b.setRazorpayPaymentId(paymentId);
+                    b.setConfirmedAt(Instant.now());
+                    b.setSlotLocked(true);
+                    bookingRepository.save(b);
+                    log.info("Booking {} successfully confirmed via webhook event {}", b.getBookingReference(), event);
+                }
+            } else if ("payment.failed".equals(event)) {
+                JsonNode paymentNode = root.path("payload").path("payment").path("entity");
+                String orderId = paymentNode.path("order_id").asText();
+                Optional<Booking> opt = bookingRepository.findByRazorpayOrderId(orderId);
+                if (opt.isPresent()) {
+                    Booking b = opt.get();
+                    if ("PENDING_PAYMENT".equalsIgnoreCase(b.getStatus())) {
+                        b.setStatus("FAILED");
+                        b.setPaymentStatus("FAILED");
+                        b.setSlotLocked(false);
+                        bookingRepository.save(b);
+                        log.info("Booking {} marked FAILED via webhook payment.failed", b.getBookingReference());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error processing Razorpay webhook: {}", e.getMessage(), e);
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Error processing webhook payload");
+        }
+    }
+
+    /**
+     * Dismisses or cancels a pending payment attempt, releasing reserved slots immediately.
+     */
+    public void dismissOrCancelPendingPayment(String reference, UserPrincipal principal) {
+        Booking booking = bookingRepository.findByBookingReference(reference)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Booking not found with reference: " + reference
+                ));
+
+        if (booking.getCustomerId() != null && principal != null && !"ADMIN".equalsIgnoreCase(principal.getRole())) {
+            if (!principal.getId().equals(booking.getCustomerId())) {
+                throw new ResponseStatusException(
+                        HttpStatus.FORBIDDEN, "Not authorized to dismiss this reservation"
+                );
+            }
+        }
+
+        if ("PENDING_PAYMENT".equalsIgnoreCase(booking.getStatus())) {
+            booking.setStatus("FAILED");
+            booking.setPaymentStatus("FAILED");
+            booking.setSlotLocked(false);
+            bookingRepository.save(booking);
+            log.info("Booking {} pending payment dismissed and slot released", reference);
+        }
+    }
+
+    /**
+     * Periodic background task running every 30 seconds to release slots of expired reservations.
+     */
+    @Scheduled(fixedDelay = 30000)
+    public void cleanExpiredReservations() {
+        cleanExpiredReservationsInternal();
+    }
+
+    private void cleanExpiredReservationsInternal() {
+        try {
+            Instant now = Instant.now();
+            List<Booking> expiredList = bookingRepository.findBySlotLockedTrueAndStatusAndExpiresAtBefore("PENDING_PAYMENT", now);
+            if (!expiredList.isEmpty()) {
+                log.info("Releasing {} expired pending reservations at {}", expiredList.size(), now);
+                for (Booking b : expiredList) {
+                    b.setStatus("EXPIRED");
+                    b.setPaymentStatus("FAILED");
+                    b.setSlotLocked(false);
+                    bookingRepository.save(b);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Notice: could not run expired reservation cleaner: {}", e.getMessage());
         }
     }
 
@@ -253,6 +565,7 @@ public class BookingService {
         return bookingRepository.findByCustomerIdOrderByBookingDateDescStartTimeDesc(customerId)
                 .stream()
                 .map(BookingResponse::fromEntity)
+                .map(this::enrichResponse)
                 .toList();
     }
 
@@ -274,7 +587,7 @@ public class BookingService {
                         HttpStatus.NOT_FOUND, "Booking not found with reference: " + reference
                 ));
 
-        BookingResponse response = BookingResponse.fromEntity(booking);
+        BookingResponse response = enrichResponse(BookingResponse.fromEntity(booking));
 
         boolean isOwner = requesterId != null && booking.getCustomerId() != null
                 && requesterId.equals(booking.getCustomerId());
@@ -290,14 +603,7 @@ public class BookingService {
 
     /**
      * Cancels an existing booking subject to server-side authorization and cancellation rules.
-     *
-     * Rules:
-     * 1. Only the customer who owns the booking or an administrator can cancel it.
-     * 2. Guest bookings cannot be cancelled by unrelated authenticated customer accounts.
-     * 3. A booking cannot be cancelled after its scheduled start time.
-     * 4. A booking that is already cancelled cannot be cancelled again.
-     * 5. Atomically transitions status to CANCELLED and sets cancelledAt, safely releasing
-     *    the reserved slots at the MongoDB storage engine level via the partial unique index.
+     * If the booking was paid, automatically initiates a refund via Razorpay.
      */
     public BookingResponse cancelBooking(String reference, UserPrincipal principal) {
         if (principal == null || principal.getId() == null) {
@@ -345,11 +651,32 @@ public class BookingService {
             );
         }
 
+        // Initiate refund if payment was captured
+        String refundId = null;
+        String refundStatus = null;
+        if ("SUCCESS".equalsIgnoreCase(booking.getPaymentStatus()) && booking.getRazorpayPaymentId() != null) {
+            try {
+                refundId = razorpayService.createRefund(booking.getRazorpayPaymentId(), booking.getTotalPrice());
+                refundStatus = refundId != null ? "REFUND_INITIATED" : "REFUND_PENDING_MANUAL";
+            } catch (Exception e) {
+                log.warn("Refund creation failed for booking {}: {}", reference, e.getMessage());
+                refundStatus = "REFUND_PENDING_MANUAL";
+            }
+        }
+
         // Perform atomic conditional update: only if currently CONFIRMED
         Query query = new Query(Criteria.where("bookingReference").is(reference).and("status").is("CONFIRMED"));
         Update update = new Update()
                 .set("status", "CANCELLED")
+                .set("slotLocked", false)
                 .set("cancelledAt", Instant.now());
+
+        if (refundId != null) {
+            update.set("refundId", refundId);
+        }
+        if (refundStatus != null) {
+            update.set("refundStatus", refundStatus);
+        }
 
         Booking updated = mongoTemplate.findAndModify(
                 query,
@@ -366,7 +693,14 @@ public class BookingService {
         }
 
         log.info("Booking {} successfully cancelled by user {}", reference, principal.getId());
-        return BookingResponse.fromEntity(updated);
+        return enrichResponse(BookingResponse.fromEntity(updated));
+    }
+
+    private BookingResponse enrichResponse(BookingResponse res) {
+        if (res != null && razorpayService != null) {
+            res.setRazorpayKeyId(razorpayService.getKeyId());
+        }
+        return res;
     }
 
     private String maskEmail(String email) {

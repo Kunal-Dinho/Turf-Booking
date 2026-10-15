@@ -55,3 +55,36 @@ export const cancelBooking = async (reference) => {
   return response.data;
 };
 
+/**
+ * Retrieves public payment configuration (test key ID & currency).
+ * Calls GET /api/payments/config
+ * @returns {Promise<{keyId: string, currency: string, paymentWindowMinutes: number}>}
+ */
+export const getPaymentConfig = async () => {
+  const response = await api.get("/api/payments/config");
+  return response.data;
+};
+
+/**
+ * Submits client checkout response to server for authoritative HMAC verification.
+ * Calls POST /api/payments/verify
+ * @param {Object} verificationData { bookingReference, razorpayOrderId, razorpayPaymentId, razorpaySignature }
+ * @returns {Promise<Object>} The confirmed booking response
+ */
+export const verifyPayment = async (verificationData) => {
+  const response = await api.post("/api/payments/verify", verificationData);
+  return response.data;
+};
+
+/**
+ * Notifies server to release slot when payment is dismissed or cancelled before completion.
+ * Calls POST /api/payments/dismiss
+ * @param {string} bookingReference
+ * @returns {Promise<Object>}
+ */
+export const dismissPayment = async (bookingReference) => {
+  const response = await api.post("/api/payments/dismiss", { bookingReference });
+  return response.data;
+};
+
+
