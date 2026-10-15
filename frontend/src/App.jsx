@@ -8,10 +8,35 @@ import {
   Calendar,
   Clock,
   CheckCircle2,
-  AlertCircle
+  AlertCircle,
+  User,
+  LogOut,
+  BookmarkCheck,
+  XCircle,
+  AlertTriangle,
+  CreditCard,
+  ShieldCheck
 } from "lucide-react";
 import ApiStatusBadge from "./components/ApiStatusBadge";
-import { getAvailability, createBooking } from "./bookingService";
+import {
+  getAvailability,
+  createBooking,
+  getMyBookings,
+  cancelBooking,
+  getBookingByReference,
+  verifyPayment,
+  dismissPayment,
+  getPaymentConfig
+} from "./bookingService";
+import {
+  register as registerCustomer,
+  login as loginCustomer,
+  logout as logoutCustomer,
+  getStoredUser,
+  getStoredToken,
+  getCurrentUser,
+  clearAuthData
+} from "./authService";
 import "./App.css";
 
 const TIME_SLOTS = [
@@ -30,6 +55,66 @@ const getTomorrowString = () => {
   return d.toISOString().split("T")[0];
 };
 
+const isBookingCancellable = (booking) => {
+  if (!booking) return false;
+  const status = (booking.status || "").toUpperCase();
+  if (status !== "CONFIRMED") return false;
+
+  try {
+    if (!booking.bookingDate || !booking.startTime) return false;
+    let year, month, day;
+    if (typeof booking.bookingDate === "string") {
+      const parts = booking.bookingDate.split("-").map(Number);
+      if (parts.length >= 3) {
+        [year, month, day] = parts;
+      } else {
+        return false;
+      }
+    } else if (Array.isArray(booking.bookingDate) && booking.bookingDate.length >= 3) {
+      [year, month, day] = booking.bookingDate;
+    } else {
+      return false;
+    }
+
+    let hour = 0;
+    let minute = 0;
+    if (typeof booking.startTime === "string") {
+      const timeParts = booking.startTime.split(":").map(Number);
+      hour = timeParts[0] || 0;
+      minute = timeParts[1] || 0;
+    } else if (Array.isArray(booking.startTime)) {
+      hour = booking.startTime[0] || 0;
+      minute = booking.startTime[1] || 0;
+    }
+
+    const bookingStart = new Date(year, month - 1, day, hour, minute);
+    return bookingStart.getTime() > Date.now();
+  } catch {
+    return false;
+  }
+};
+
+const loadRazorpayScript = () => {
+  return new Promise((resolve) => {
+    if (window.Razorpay) {
+      resolve(true);
+      return;
+    }
+    const existing = document.querySelector('script[src="https://checkout.razorpay.com/v1/checkout.js"]');
+    if (existing) {
+      existing.addEventListener("load", () => resolve(true));
+      existing.addEventListener("error", () => resolve(false));
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.async = true;
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+};
+
 function App() {
   const [search, setSearch] = useState("");
   const [sport, setSport] = useState("All");
@@ -39,18 +124,83 @@ function App() {
   const [turfsLoading, setTurfsLoading] = useState(true);
   const [turfsError, setTurfsError] = useState("");
 
+  // Customer session & authentication states
+  const [currentUser, setCurrentUser] = useState(() => {
+    const token = getStoredToken();
+    const user = getStoredUser();
+    return token && user ? user : null;
+  });
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authMode, setAuthMode] = useState("login"); // 'login' | 'register'
+  const [authName, setAuthName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState("");
+
+  // My Bookings modal states
+  const [myBookingsOpen, setMyBookingsOpen] = useState(false);
+  const [myBookings, setMyBookings] = useState([]);
+  const [myBookingsLoading, setMyBookingsLoading] = useState(false);
+  const [myBookingsError, setMyBookingsError] = useState("");
+  const [cancellingBooking, setCancellingBooking] = useState(null);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState("");
+  const [cancelSuccess, setCancelSuccess] = useState("");
+
+  // Reference lookup state within My Bookings modal
+  const [refSearch, setRefSearch] = useState("");
+  const [refSearchResult, setRefSearchResult] = useState(null);
+  const [refSearchLoading, setRefSearchLoading] = useState(false);
+  const [refSearchError, setRefSearchError] = useState("");
+
   // Booking modal and form states
   const [modalStep, setModalStep] = useState("details"); // 'details' | 'form' | 'success'
   const [bookingDate, setBookingDate] = useState(getTomorrowString);
   const [bookingTime, setBookingTime] = useState("18:00");
   const [durationHours, setDurationHours] = useState(1);
-  const [customerName, setCustomerName] = useState("");
-  const [customerEmail, setCustomerEmail] = useState("");
+  const [customerName, setCustomerName] = useState(() => getStoredUser()?.name || "");
+  const [customerEmail, setCustomerEmail] = useState(() => getStoredUser()?.email || "");
   const [customerPhone, setCustomerPhone] = useState("");
   const [bookedSlots, setBookedSlots] = useState([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [bookingError, setBookingError] = useState("");
   const [confirmedBooking, setConfirmedBooking] = useState(null);
+  const [bookingError, setBookingError] = useState("");
+  const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
+  const [pendingBooking, setPendingBooking] = useState(null);
+  const [paymentNotice, setPaymentNotice] = useState("");
+  const [paymentConfig, setPaymentConfig] = useState(null);
+
+  // Load public Razorpay test configuration on mount
+  useEffect(() => {
+    getPaymentConfig()
+      .then((cfg) => setPaymentConfig(cfg))
+      .catch((err) => console.warn("Payment config load deferred:", err));
+  }, []);
+
+  // Restore & verify authenticated session on mount
+  useEffect(() => {
+    const token = getStoredToken();
+    if (token) {
+      getCurrentUser()
+        .then((user) => {
+          setCurrentUser(user);
+          if (user.name) setCustomerName(user.name);
+          if (user.email) setCustomerEmail(user.email);
+        })
+        .catch((err) => {
+          if (err.response?.status === 401) {
+            clearAuthData();
+            setCurrentUser(null);
+          } else {
+            const stored = getStoredUser();
+            if (stored) setCurrentUser(stored);
+          }
+        });
+    } else {
+      clearAuthData();
+    }
+  }, []);
 
   const filteredTurfs = turfs.filter((turf) => {
     const matchesSearch =
@@ -102,9 +252,15 @@ function App() {
   }, [selectedTurf, bookingDate]);
 
   const handleOpenTurf = (turf) => {
+    setMyBookingsOpen(false);
+    setAuthModalOpen(false);
     setSelectedTurf(turf);
     setModalStep("details");
     setBookingError("");
+    if (currentUser) {
+      if (!customerName && currentUser.name) setCustomerName(currentUser.name);
+      if (!customerEmail && currentUser.email) setCustomerEmail(currentUser.email);
+    }
   };
 
   const handleCloseModal = () => {
@@ -112,6 +268,181 @@ function App() {
     setModalStep("details");
     setBookingError("");
     setConfirmedBooking(null);
+    setPendingBooking(null);
+    setPaymentNotice("");
+  };
+
+  const handleCancelPendingReservation = async () => {
+    if (!pendingBooking) return;
+    try {
+      await dismissPayment(pendingBooking.bookingReference);
+      setPendingBooking(null);
+      setPaymentNotice("");
+      if (selectedTurf) {
+        getAvailability(selectedTurf.id, bookingDate)
+          .then((data) => setBookedSlots(data.bookedSlots || []))
+          .catch((err) => console.error("Availability refresh failed:", err));
+      }
+    } catch (err) {
+      console.warn("Failed to dismiss pending reservation:", err);
+    }
+  };
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setAuthSubmitting(true);
+    setAuthError("");
+
+    try {
+      let data;
+      if (authMode === "register") {
+        data = await registerCustomer(authName.trim(), authEmail.trim(), authPassword);
+      } else {
+        data = await loginCustomer(authEmail.trim(), authPassword);
+      }
+      const user = { id: data.id, name: data.name, email: data.email };
+      setCurrentUser(user);
+      setAuthModalOpen(false);
+      setAuthPassword("");
+      // Sync form fields with authenticated customer details
+      setCustomerName(user.name || "");
+      setCustomerEmail(user.email || "");
+    } catch (err) {
+      const errorMsg =
+        err.response?.data?.message ||
+        err.response?.data?.error ||
+        err.message ||
+        "Authentication failed. Please verify your credentials.";
+      setAuthError(errorMsg);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = () => {
+    logoutCustomer();
+    setCurrentUser(null);
+    setMyBookingsOpen(false);
+    setMyBookings([]);
+    setCancellingBooking(null);
+    setCancelError("");
+    setCancelSuccess("");
+    setRefSearch("");
+    setRefSearchResult(null);
+    setRefSearchError("");
+    setCustomerName("");
+    setCustomerEmail("");
+    setCustomerPhone("");
+  };
+
+  const handleOpenMyBookings = async () => {
+    setSelectedTurf(null);
+    setAuthModalOpen(false);
+    setMyBookingsOpen(true);
+    setMyBookingsLoading(true);
+    setMyBookingsError("");
+    setCancelError("");
+    setCancelSuccess("");
+    setRefSearchResult(null);
+    setRefSearchError("");
+    try {
+      const data = await getMyBookings();
+      setMyBookings(Array.isArray(data) ? data : []);
+    } catch (err) {
+      if (err.response?.status === 401) {
+        handleLogout();
+        setAuthError("Your session has expired. Please sign in again.");
+        setAuthModalOpen(true);
+        return;
+      }
+      const errorMsg =
+        err.response?.data?.message ||
+        err.message ||
+        "Failed to load your reservations. Please try again.";
+      setMyBookingsError(errorMsg);
+    } finally {
+      setMyBookingsLoading(false);
+    }
+  };
+
+  const handleLookupReference = async () => {
+    const trimmed = refSearch.trim();
+    if (!trimmed) return;
+    setRefSearchLoading(true);
+    setRefSearchError("");
+    setRefSearchResult(null);
+    try {
+      const data = await getBookingByReference(trimmed);
+      setRefSearchResult(data);
+    } catch (err) {
+      const errorMsg =
+        err.response?.status === 404
+          ? `No reservation found with reference "${trimmed}". Please check the code.`
+          : err.response?.data?.message || err.message || "Failed to find booking.";
+      setRefSearchError(errorMsg);
+    } finally {
+      setRefSearchLoading(false);
+    }
+  };
+
+
+  const handleInitiateCancel = (booking) => {
+    setCancelError("");
+    setCancelSuccess("");
+    setCancellingBooking(booking);
+  };
+
+  const handleConfirmCancel = async () => {
+    if (!cancellingBooking) return;
+    setIsCancelling(true);
+    setCancelError("");
+    try {
+      const updated = await cancelBooking(cancellingBooking.bookingReference);
+      setCancelSuccess(`Reservation ${updated.bookingReference} was cancelled successfully. The reserved slot has been released.`);
+      setCancellingBooking(null);
+
+      // Reflect cancelled status immediately in local list
+      setMyBookings((prev) =>
+        prev.map((b) =>
+          b.bookingReference === updated.bookingReference
+            ? { ...b, status: "CANCELLED", cancelledAt: updated.cancelledAt }
+            : b
+        )
+      );
+
+      // Update search result card if that was the one cancelled
+      if (refSearchResult && refSearchResult.bookingReference === updated.bookingReference) {
+        setRefSearchResult((prev) => ({
+          ...prev,
+          status: "CANCELLED",
+          cancelledAt: updated.cancelledAt
+        }));
+      }
+
+      // Re-fetch availability if turf booking modal is active
+      if (selectedTurf) {
+        getAvailability(selectedTurf.id, bookingDate)
+          .then((data) => setBookedSlots(data.bookedSlots || []))
+          .catch((err) => console.error("Availability refresh failed:", err));
+      }
+    } catch (err) {
+      if (err.response?.status === 401) {
+        handleLogout();
+        setAuthError("Your session has expired. Please sign in again.");
+        setAuthModalOpen(true);
+        setMyBookingsOpen(false);
+        setCancellingBooking(null);
+      } else {
+        const errorMsg =
+          err.response?.data?.message ||
+          err.response?.data?.error ||
+          err.message ||
+          "Failed to cancel booking. Please try again.";
+        setCancelError(errorMsg);
+      }
+    } finally {
+      setIsCancelling(false);
+    }
   };
 
   const handleBookingSubmit = async (e) => {
@@ -119,6 +450,7 @@ function App() {
     if (!selectedTurf) return;
     setIsSubmitting(true);
     setBookingError("");
+    setPaymentNotice("");
 
     try {
       const payload = {
@@ -131,9 +463,84 @@ function App() {
         durationHours: Number(durationHours),
       };
 
-      const result = await createBooking(payload);
-      setConfirmedBooking(result);
-      setModalStep("success");
+      // 1. Create booking & Razorpay order (backend locks the slot atomically)
+      const bookingData = await createBooking(payload);
+      setPendingBooking(bookingData);
+
+      // 2. Load Razorpay Checkout SDK script
+      const scriptLoaded = await loadRazorpayScript();
+      if (!scriptLoaded) {
+        setBookingError("Unable to load Razorpay payment SDK. Please verify your connection.");
+        setIsSubmitting(false);
+        return;
+      }
+
+      // 3. Resolve keyId (backend config or order response keyId)
+      const keyId =
+        paymentConfig?.keyId ||
+        bookingData.razorpayKeyId ||
+        "rzp_test_mock_turfbook";
+
+      // 4. Configure Razorpay Options
+      const options = {
+        key: keyId,
+        amount: Math.round(Number(bookingData.totalPrice) * 100),
+        currency: "INR",
+        name: "TurfBook Sports",
+        description: `Booking for ${selectedTurf.name} (${bookingDate} ${bookingTime})`,
+        order_id: bookingData.razorpayOrderId,
+        prefill: {
+          name: customerName.trim(),
+          email: customerEmail.trim(),
+          contact: customerPhone.trim() || undefined,
+        },
+        theme: {
+          color: "#059669",
+        },
+        modal: {
+          ondismiss: () => {
+            setIsSubmitting(false);
+            setPaymentNotice(
+              `Payment window active. Your slot is reserved for 10 minutes (Ref: ${bookingData.bookingReference}). Complete payment to confirm or cancel to release immediately.`
+            );
+          },
+        },
+        handler: async (response) => {
+          setIsVerifyingPayment(true);
+          try {
+            const verified = await verifyPayment({
+              bookingReference: bookingData.bookingReference,
+              razorpayOrderId: response.razorpay_order_id || bookingData.razorpayOrderId,
+              razorpayPaymentId: response.razorpay_payment_id,
+              razorpaySignature: response.razorpay_signature,
+            });
+            setConfirmedBooking(verified);
+            setPendingBooking(null);
+            setPaymentNotice("");
+            setModalStep("success");
+          } catch (verifyErr) {
+            const errText =
+              verifyErr.response?.data?.message ||
+              verifyErr.response?.data?.error ||
+              verifyErr.message ||
+              "Payment verification failed. Please contact support.";
+            setBookingError(errText);
+          } finally {
+            setIsVerifyingPayment(false);
+            setIsSubmitting(false);
+          }
+        },
+      };
+
+      const razorpayInstance = new window.Razorpay(options);
+      razorpayInstance.on("payment.failed", (failResponse) => {
+        console.error("Razorpay payment failed:", failResponse.error);
+        setBookingError(
+          `Payment could not be completed: ${failResponse.error?.description || failResponse.error?.reason || "Transaction failed"}`
+        );
+        setIsSubmitting(false);
+      });
+      razorpayInstance.open();
     } catch (err) {
       const errorMsg =
         err.response?.data?.message ||
@@ -141,7 +548,6 @@ function App() {
         err.message ||
         "Booking submission failed. Please try again.";
       setBookingError(errorMsg);
-    } finally {
       setIsSubmitting(false);
     }
   };
@@ -161,14 +567,43 @@ function App() {
 
         <div className="navbar-actions">
           <ApiStatusBadge />
-          <button
-            className="login-button"
-            onClick={() =>
-              alert("Login will be implemented in a later phase.")
-            }
-          >
-            Sign in
-          </button>
+          {currentUser ? (
+            <div className="user-nav-group">
+              <button
+                className="my-bookings-btn"
+                onClick={handleOpenMyBookings}
+                aria-label="View my bookings"
+              >
+                <BookmarkCheck size={16} />
+                <span>My Bookings</span>
+              </button>
+              <div className="user-profile-badge" title={currentUser.email}>
+                <User size={15} />
+                <span className="user-name">
+                  {currentUser.name ? currentUser.name.split(" ")[0] : (currentUser.email ? currentUser.email.split("@")[0] : "Player")}
+                </span>
+              </div>
+              <button
+                className="logout-button"
+                onClick={handleLogout}
+                aria-label="Sign out"
+                title="Sign out"
+              >
+                <LogOut size={16} />
+              </button>
+            </div>
+          ) : (
+            <button
+              className="login-button"
+              onClick={() => {
+                setAuthMode("login");
+                setAuthError("");
+                setAuthModalOpen(true);
+              }}
+            >
+              Sign in
+            </button>
+          )}
         </div>
       </header>
 
@@ -261,11 +696,10 @@ function App() {
                 {filteredTurfs.map((turf) => (
                   <article className="turf-card" key={turf.id}>
                     <div
-                      className={`turf-image ${
-                        turf.sport?.toLowerCase() === "cricket"
+                      className={`turf-image ${turf.sport?.toLowerCase() === "cricket"
                           ? "orange"
                           : "blue"
-                      }`}
+                        }`}
                     >
                       <span className="sport-emoji">
                         {turf.sport?.toLowerCase() === "cricket"
@@ -423,6 +857,22 @@ function App() {
                   </div>
                 )}
 
+                {paymentNotice && (
+                  <div className="booking-alert-notice" role="status">
+                    <div className="notice-body">
+                      <Clock size={16} />
+                      <span>{paymentNotice}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="release-slot-inline-btn"
+                      onClick={handleCancelPendingReservation}
+                    >
+                      Release Slot
+                    </button>
+                  </div>
+                )}
+
                 <div className="form-group-row">
                   <div className="form-group">
                     <label htmlFor="booking-date">
@@ -529,20 +979,26 @@ function App() {
                 </div>
 
                 <div className="guest-booking-notice">
-                  ℹ️ Guest checkout mode. Payment gateway and account synchronization will be enabled in upcoming phases.
+                  {currentUser ? (
+                    `ℹ️ Authenticated as ${currentUser.name}. This reservation will automatically be linked to your account.`
+                  ) : (
+                    "ℹ️ Guest checkout mode. Sign in to link your reservations to your personal account."
+                  )}
                 </div>
 
                 <button
                   type="submit"
-                  className="booking-button"
-                  disabled={isSubmitting || bookedSlots.includes(bookingTime)}
+                  className="booking-button payment-submit-btn"
+                  disabled={isSubmitting || isVerifyingPayment || bookedSlots.includes(bookingTime)}
                 >
-                  {isSubmitting ? (
-                    "Processing Booking..."
+                  {isVerifyingPayment ? (
+                    "Verifying Payment..."
+                  ) : isSubmitting ? (
+                    "Opening Razorpay Gateway..."
                   ) : (
                     <>
-                      Confirm Reservation
-                      <ArrowRight size={18} />
+                      <CreditCard size={18} />
+                      Proceed to Pay · ₹{Number(selectedTurf.pricePerHour * durationHours).toLocaleString("en-IN")}
                     </>
                   )}
                 </button>
@@ -582,8 +1038,21 @@ function App() {
                     <span>Customer</span>
                     <strong>{confirmedBooking.customerName}</strong>
                   </div>
+                  <div className="summary-row">
+                    <span>Payment Status</span>
+                    <strong className="payment-status-paid">
+                      <ShieldCheck size={14} style={{ display: "inline", verticalAlign: "middle", marginRight: 4 }} />
+                      PAID (Razorpay)
+                    </strong>
+                  </div>
+                  {confirmedBooking.razorpayPaymentId && (
+                    <div className="summary-row">
+                      <span>Payment ID</span>
+                      <code className="payment-ref-code">{confirmedBooking.razorpayPaymentId}</code>
+                    </div>
+                  )}
                   <div className="summary-row total-row">
-                    <span>Total Price</span>
+                    <span>Total Paid</span>
                     <strong className="success-total">
                       ₹{Number(confirmedBooking.totalPrice).toLocaleString("en-IN")}
                     </strong>
@@ -591,19 +1060,461 @@ function App() {
                 </div>
 
                 <p className="success-guest-note">
-                  Your reservation is confirmed under status <strong>{confirmedBooking.status}</strong>.
+                  {currentUser ? (
+                    <>
+                      Linked to your account (<strong>{currentUser.email}</strong>). View all your reservations in <strong>My Bookings</strong>.
+                    </>
+                  ) : (
+                    <>
+                      Your reservation is confirmed under status <strong>{confirmedBooking.status}</strong>. Keep your booking reference handy!
+                    </>
+                  )}
                 </p>
 
-                <button
-                  type="button"
-                  className="booking-button"
-                  onClick={handleCloseModal}
-                >
-                  Done
-                </button>
+                <div className="form-group-row">
+                  {currentUser && (
+                    <button
+                      type="button"
+                      className="modal-back-btn"
+                      style={{ justifyContent: "center", padding: "12px", width: "100%" }}
+                      onClick={() => {
+                        handleCloseModal();
+                        handleOpenMyBookings();
+                      }}
+                    >
+                      <BookmarkCheck size={16} /> View My Bookings
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="booking-button"
+                    style={{ marginTop: 0 }}
+                    onClick={handleCloseModal}
+                  >
+                    Done
+                  </button>
+                </div>
               </div>
             )}
           </section>
+        </div>
+      )}
+
+      {/* Auth Modal: Sign In / Create Account */}
+      {authModalOpen && (
+        <div className="turf-modal-backdrop" onClick={() => setAuthModalOpen(false)}>
+          <section
+            className="turf-modal auth-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              onClick={() => setAuthModalOpen(false)}
+              aria-label="Close modal"
+            >
+              ×
+            </button>
+
+            <div className="auth-tabs">
+              <button
+                type="button"
+                className={`auth-tab ${authMode === "login" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthError("");
+                }}
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                className={`auth-tab ${authMode === "register" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("register");
+                  setAuthError("");
+                }}
+              >
+                Create Account
+              </button>
+            </div>
+
+            <h2 id="auth-modal-title">
+              {authMode === "login" ? "Welcome back" : "Create your account"}
+            </h2>
+            <p className="auth-modal-sub">
+              {authMode === "login"
+                ? "Sign in to access your bookings and reserve turfs quickly."
+                : "Register with TurfBook to manage and view all your reservations."}
+            </p>
+
+            {authError && (
+              <div className="booking-alert-error" role="alert">
+                <AlertCircle size={18} />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleAuthSubmit} className="booking-form auth-form">
+              {authMode === "register" && (
+                <div className="form-group">
+                  <label htmlFor="auth-name">Full Name</label>
+                  <input
+                    id="auth-name"
+                    type="text"
+                    placeholder="e.g. Alex Hunter"
+                    value={authName}
+                    onChange={(e) => setAuthName(e.target.value)}
+                    required
+                  />
+                </div>
+              )}
+
+              <div className="form-group">
+                <label htmlFor="auth-email">Email Address</label>
+                <input
+                  id="auth-email"
+                  type="email"
+                  placeholder="alex@example.com"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="auth-password">Password</label>
+                <input
+                  id="auth-password"
+                  type="password"
+                  placeholder={authMode === "register" ? "Minimum 6 characters" : "••••••••"}
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  minLength={authMode === "register" ? 6 : undefined}
+                  required
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="booking-button auth-submit-btn"
+                disabled={authSubmitting}
+              >
+                {authSubmitting ? (
+                  "Processing..."
+                ) : authMode === "login" ? (
+                  <>
+                    Sign In
+                    <ArrowRight size={18} />
+                  </>
+                ) : (
+                  <>
+                    Create Account
+                    <ArrowRight size={18} />
+                  </>
+                )}
+              </button>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {/* My Bookings Modal: Protected Customer Reservations */}
+      {myBookingsOpen && (
+        <div className="turf-modal-backdrop" onClick={() => setMyBookingsOpen(false)}>
+          <section
+            className="turf-modal booking-modal-wide my-bookings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="my-bookings-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              onClick={() => setMyBookingsOpen(false)}
+              aria-label="Close modal"
+            >
+              ×
+            </button>
+
+            <span className="eyebrow">CUSTOMER PORTAL</span>
+            <h2 id="my-bookings-title">My Bookings</h2>
+            <p className="booking-modal-sub">
+              Your confirmed ground reservations for <strong>{currentUser?.name || currentUser?.email || "your account"}</strong>
+            </p>
+
+            {/* Reference Lookup Section for checking any reservation or guest checkout */}
+            <div className="booking-lookup-panel">
+              <span className="booking-lookup-label">Have a booking reference from guest checkout?</span>
+              <div className="booking-lookup-input-group">
+                <input
+                  type="text"
+                  placeholder="Enter reference e.g. TB-261014-A3F2"
+                  value={refSearch}
+                  onChange={(e) => setRefSearch(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleLookupReference();
+                    }
+                  }}
+                  aria-label="Search reservation by reference"
+                />
+                <button
+                  type="button"
+                  className="booking-lookup-btn"
+                  onClick={handleLookupReference}
+                  disabled={refSearchLoading || !refSearch.trim()}
+                >
+                  {refSearchLoading ? "Checking..." : "Look Up"}
+                </button>
+              </div>
+
+              {refSearchError && (
+                <div className="booking-alert-error lookup-alert" role="alert">
+                  <AlertCircle size={15} />
+                  <span>{refSearchError}</span>
+                </div>
+              )}
+
+              {refSearchResult && (
+                <article className={`my-booking-card lookup-result-card ${refSearchResult.status?.toLowerCase()}`}>
+                  <div className="my-booking-header">
+                    <div>
+                      <h4>{refSearchResult.turfName}</h4>
+                      <span className="booking-ref-tag">{refSearchResult.bookingReference}</span>
+                    </div>
+                    <div className="status-badges-group">
+                      <span className={`status-pill ${refSearchResult.status?.toLowerCase()}`}>
+                        {refSearchResult.status}
+                      </span>
+                      {refSearchResult.paymentStatus && (
+                        <span className={`payment-pill ${refSearchResult.paymentStatus.toLowerCase()}`}>
+                          {refSearchResult.paymentStatus}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="my-booking-details">
+                    <p>
+                      <Calendar size={14} />
+                      <span>{refSearchResult.bookingDate}</span>
+                    </p>
+                    <p>
+                      <Clock size={14} />
+                      <span>{refSearchResult.startTime} – {refSearchResult.endTime} ({refSearchResult.durationHours} hr{refSearchResult.durationHours > 1 ? "s" : ""})</span>
+                    </p>
+                    <p className="my-booking-price">
+                      Total: <strong>₹{Number(refSearchResult.totalPrice).toLocaleString("en-IN")}</strong>
+                    </p>
+                  </div>
+
+                  <div className="my-booking-footer">
+                    {isBookingCancellable(refSearchResult) ? (
+                      <button
+                        type="button"
+                        className="cancel-booking-btn"
+                        onClick={() => handleInitiateCancel(refSearchResult)}
+                        aria-label={`Cancel reservation ${refSearchResult.bookingReference}`}
+                      >
+                        <XCircle size={14} />
+                        <span>Cancel Reservation</span>
+                      </button>
+                    ) : refSearchResult.status === "CONFIRMED" ? (
+                      <span className="booking-status-note past">
+                        Past start time (Cancellation closed)
+                      </span>
+                    ) : (
+                      <span className="booking-status-note cancelled">
+                        Cancelled · Slot released
+                      </span>
+                    )}
+                  </div>
+                </article>
+              )}
+            </div>
+
+            {myBookingsLoading && (
+              <p className="empty-state">Loading your reservations...</p>
+            )}
+
+            {cancelSuccess && (
+              <div className="booking-alert-success" role="status">
+                <CheckCircle2 size={18} />
+                <span>{cancelSuccess}</span>
+              </div>
+            )}
+
+            {myBookingsError && (
+              <div className="booking-alert-error" role="alert">
+                <AlertCircle size={18} />
+                <span>{myBookingsError}</span>
+              </div>
+            )}
+
+            {!myBookingsLoading && !myBookingsError && (
+              <>
+                {myBookings.length === 0 ? (
+                  <div className="my-bookings-empty">
+                    <p className="empty-state">
+                      No reservations found linked to your account yet.
+                    </p>
+                    <p className="empty-state-sub">
+                      Note: Bookings made before signing in (guest checkouts) are saved with <code>customerId = null</code> and do not appear under your account history. You can look them up by reference code above.
+                    </p>
+                    <button
+                      className="booking-button"
+                      onClick={() => {
+                        setMyBookingsOpen(false);
+                        document.getElementById("turfs")?.scrollIntoView({ behavior: "smooth" });
+                      }}
+                    >
+                      Explore Turfs Now
+                    </button>
+                  </div>
+                ) : (
+                  <div className="my-bookings-list">
+                    {myBookings.map((b) => (
+                      <article className={`my-booking-card ${b.status?.toLowerCase()}`} key={b.id || b.bookingReference}>
+                        <div className="my-booking-header">
+                          <div>
+                            <h4>{b.turfName}</h4>
+                            <span className="booking-ref-tag">{b.bookingReference}</span>
+                          </div>
+                          <div className="status-badges-group">
+                            <span className={`status-pill ${b.status?.toLowerCase()}`}>
+                              {b.status}
+                            </span>
+                            {b.paymentStatus && (
+                              <span className={`payment-pill ${b.paymentStatus.toLowerCase()}`}>
+                                {b.paymentStatus}
+                              </span>
+                            )}
+                            {b.refundStatus && b.refundStatus !== "NOT_APPLICABLE" && (
+                              <span className={`refund-pill ${b.refundStatus.toLowerCase()}`}>
+                                Refund: {b.refundStatus}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="my-booking-details">
+                          <p>
+                            <Calendar size={14} />
+                            <span>{b.bookingDate}</span>
+                          </p>
+                          <p>
+                            <Clock size={14} />
+                            <span>{b.startTime} – {b.endTime} ({b.durationHours} hr{b.durationHours > 1 ? "s" : ""})</span>
+                          </p>
+                          <p className="my-booking-price">
+                            Total: <strong>₹{Number(b.totalPrice).toLocaleString("en-IN")}</strong>
+                          </p>
+                        </div>
+
+                        <div className="my-booking-footer">
+                          {isBookingCancellable(b) ? (
+                            <button
+                              type="button"
+                              className="cancel-booking-btn"
+                              onClick={() => handleInitiateCancel(b)}
+                              aria-label={`Cancel reservation ${b.bookingReference}`}
+                            >
+                              <XCircle size={14} />
+                              <span>Cancel Reservation</span>
+                            </button>
+                          ) : b.status === "CONFIRMED" ? (
+                            <span className="booking-status-note past">
+                              Past start time (Cancellation closed)
+                            </span>
+                          ) : (
+                            <span className="booking-status-note cancelled">
+                              Cancelled · Slot released
+                            </span>
+                          )}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* Cancellation Confirmation Dialog Overlay (top-level fixed dialog) */}
+      {cancellingBooking && (
+        <div
+          className="cancel-confirm-backdrop"
+          onClick={() => !isCancelling && setCancellingBooking(null)}
+        >
+          <div
+            className="cancel-confirm-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="cancel-confirm-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="cancel-confirm-header">
+              <AlertTriangle size={24} className="cancel-icon-warning" />
+              <div>
+                <h3 id="cancel-confirm-title">Cancel Reservation?</h3>
+                <span className="cancel-ref-sub">Ref: {cancellingBooking.bookingReference}</span>
+              </div>
+            </div>
+
+            <div className="cancel-confirm-body">
+              <p>
+                Are you sure you want to cancel your reservation for <strong>{cancellingBooking.turfName}</strong> on <strong>{cancellingBooking.bookingDate}</strong> from <strong>{cancellingBooking.startTime} to {cancellingBooking.endTime}</strong>?
+              </p>
+
+              {(cancellingBooking.paymentStatus === "SUCCESS" || cancellingBooking.paymentStatus === "PAID") && (
+                <div className="cancellation-refund-notice">
+                  <ShieldCheck size={16} />
+                  <span>
+                    A full refund of <strong>₹{Number(cancellingBooking.totalPrice).toLocaleString("en-IN")}</strong> will be automatically initiated to your original payment method via Razorpay.
+                  </span>
+                </div>
+              )}
+
+              <div className="cancellation-policy-box">
+                <span className="policy-badge">Cancellation Policy</span>
+                <p>
+                  Bookings can only be cancelled prior to scheduled start time. Upon cancellation, your reserved slot is immediately released and made available for other players.
+                </p>
+              </div>
+
+              {cancelError && (
+                <div className="booking-alert-error" role="alert">
+                  <AlertCircle size={16} />
+                  <span>{cancelError}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="cancel-confirm-footer">
+              <button
+                type="button"
+                className="keep-booking-btn"
+                onClick={() => setCancellingBooking(null)}
+                disabled={isCancelling}
+              >
+                Keep Reservation
+              </button>
+              <button
+                type="button"
+                className="confirm-cancel-btn"
+                onClick={handleConfirmCancel}
+                disabled={isCancelling}
+              >
+                {isCancelling ? "Cancelling..." : "Yes, Cancel Booking"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

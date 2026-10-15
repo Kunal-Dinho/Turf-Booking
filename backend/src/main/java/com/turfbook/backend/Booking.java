@@ -32,7 +32,10 @@ public class Booking {
     private String turfId;
     private String turfName;
 
-    // Guest checkout details (Authentication Phase: will link to User ID)
+    // Linked customer ID (null for guest checkout, populated for authenticated customers)
+    @Indexed
+    private String customerId;
+
     private String customerName;
     private String customerEmail;
     private String customerPhone;
@@ -50,8 +53,27 @@ public class Booking {
     private double hourlyRate;
     private double totalPrice;
 
-    // Status: CONFIRMED, CANCELLED (Payment Phase: will include PENDING_PAYMENT)
+    // Status: PENDING_PAYMENT, CONFIRMED, CANCELLED, EXPIRED, FAILED
     private String status;
+
+    // Slot locking indicator for MongoDB partial unique index (true while active reservation or confirmed)
+    @Indexed
+    private boolean slotLocked = true;
+
+    // Payment lifecycle: CREATED, SUCCESS, FAILED, REFUNDED
+    private String paymentStatus;
+
+    @Indexed
+    private String razorpayOrderId;
+    private String razorpayPaymentId;
+    private String razorpaySignature;
+
+    @Indexed
+    private Instant expiresAt;
+    private Instant confirmedAt;
+
+    private String refundStatus;
+    private String refundId;
 
     /**
      * Unique slot keys for each discrete hour reserved.
@@ -60,6 +82,7 @@ public class Booking {
     private List<String> slotKeys = new ArrayList<>();
 
     private Instant createdAt;
+    private Instant cancelledAt;
 
     public Booking() {
     }
@@ -206,11 +229,99 @@ public class Booking {
         this.slotKeys = slotKeys;
     }
 
+    public String getCustomerId() {
+        return customerId;
+    }
+
+    public void setCustomerId(String customerId) {
+        this.customerId = customerId;
+    }
+
     public Instant getCreatedAt() {
         return createdAt;
     }
 
     public void setCreatedAt(Instant createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public boolean isSlotLocked() {
+        return slotLocked;
+    }
+
+    public void setSlotLocked(boolean slotLocked) {
+        this.slotLocked = slotLocked;
+    }
+
+    public String getPaymentStatus() {
+        return paymentStatus;
+    }
+
+    public void setPaymentStatus(String paymentStatus) {
+        this.paymentStatus = paymentStatus;
+    }
+
+    public String getRazorpayOrderId() {
+        return razorpayOrderId;
+    }
+
+    public void setRazorpayOrderId(String razorpayOrderId) {
+        this.razorpayOrderId = razorpayOrderId;
+    }
+
+    public String getRazorpayPaymentId() {
+        return razorpayPaymentId;
+    }
+
+    public void setRazorpayPaymentId(String razorpayPaymentId) {
+        this.razorpayPaymentId = razorpayPaymentId;
+    }
+
+    public String getRazorpaySignature() {
+        return razorpaySignature;
+    }
+
+    public void setRazorpaySignature(String razorpaySignature) {
+        this.razorpaySignature = razorpaySignature;
+    }
+
+    public Instant getExpiresAt() {
+        return expiresAt;
+    }
+
+    public void setExpiresAt(Instant expiresAt) {
+        this.expiresAt = expiresAt;
+    }
+
+    public Instant getConfirmedAt() {
+        return confirmedAt;
+    }
+
+    public void setConfirmedAt(Instant confirmedAt) {
+        this.confirmedAt = confirmedAt;
+    }
+
+    public String getRefundStatus() {
+        return refundStatus;
+    }
+
+    public void setRefundStatus(String refundStatus) {
+        this.refundStatus = refundStatus;
+    }
+
+    public String getRefundId() {
+        return refundId;
+    }
+
+    public void setRefundId(String refundId) {
+        this.refundId = refundId;
+    }
+
+    public Instant getCancelledAt() {
+        return cancelledAt;
+    }
+
+    public void setCancelledAt(Instant cancelledAt) {
+        this.cancelledAt = cancelledAt;
     }
 }

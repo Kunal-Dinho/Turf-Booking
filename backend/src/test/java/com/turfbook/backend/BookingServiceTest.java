@@ -70,7 +70,9 @@ class BookingServiceTest {
         assertEquals("turf-123", response.getTurfId());
         assertEquals("Blue Arena", response.getTurfName());
         assertEquals(2400.0, response.getTotalPrice(), "Total price must be 1200 * 2 = 2400.0");
-        assertEquals("CONFIRMED", response.getStatus());
+        assertEquals("PENDING_PAYMENT", response.getStatus());
+        assertEquals("CREATED", response.getPaymentStatus());
+        assertTrue(response.isSlotLocked());
         assertNotNull(response.getBookingReference());
         assertTrue(response.getBookingReference().startsWith("TB-"));
         assertEquals(LocalTime.of(18, 0), response.getStartTime());
