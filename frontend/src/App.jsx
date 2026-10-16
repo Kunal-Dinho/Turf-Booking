@@ -15,7 +15,9 @@ import {
   XCircle,
   AlertTriangle,
   CreditCard,
-  ShieldCheck
+  ShieldCheck,
+  Smartphone,
+  Building2
 } from "lucide-react";
 import ApiStatusBadge from "./components/ApiStatusBadge";
 import {
@@ -170,6 +172,8 @@ function App() {
   const [pendingBooking, setPendingBooking] = useState(null);
   const [paymentNotice, setPaymentNotice] = useState("");
   const [paymentConfig, setPaymentConfig] = useState(null);
+  const [simulatorModalOpen, setSimulatorModalOpen] = useState(false);
+  const [simulatorPaymentMethod, setSimulatorPaymentMethod] = useState("card");
 
   // Load public Razorpay test configuration on mount
   useEffect(() => {
@@ -270,6 +274,7 @@ function App() {
     setConfirmedBooking(null);
     setPendingBooking(null);
     setPaymentNotice("");
+    setSimulatorModalOpen(false);
   };
 
   const handleCancelPendingReservation = async () => {
@@ -278,6 +283,7 @@ function App() {
       await dismissPayment(pendingBooking.bookingReference);
       setPendingBooking(null);
       setPaymentNotice("");
+      setSimulatorModalOpen(false);
       if (selectedTurf) {
         getAvailability(selectedTurf.id, bookingDate)
           .then((data) => setBookedSlots(data.bookedSlots || []))
@@ -285,6 +291,55 @@ function App() {
       }
     } catch (err) {
       console.warn("Failed to dismiss pending reservation:", err);
+    }
+  };
+
+  const handleSimulatorSuccess = async () => {
+    if (!pendingBooking) return;
+    setIsVerifyingPayment(true);
+    setBookingError("");
+    try {
+      const simPaymentId = "pay_sim_" + Math.random().toString(36).substring(2, 12);
+      const simSignature = "sim_sig_" + Math.random().toString(36).substring(2, 16);
+      const verified = await verifyPayment({
+        bookingReference: pendingBooking.bookingReference,
+        razorpayOrderId: pendingBooking.razorpayOrderId,
+        razorpayPaymentId: simPaymentId,
+        razorpaySignature: simSignature,
+      });
+      setConfirmedBooking(verified);
+      setPendingBooking(null);
+      setPaymentNotice("");
+      setSimulatorModalOpen(false);
+      setModalStep("success");
+    } catch (err) {
+      const errText =
+        err.response?.data?.message ||
+        err.response?.data?.error ||
+        err.message ||
+        "Payment verification failed. Please try again.";
+      setBookingError(errText);
+    } finally {
+      setIsVerifyingPayment(false);
+    }
+  };
+
+  const handleSimulatorFailure = () => {
+    setSimulatorModalOpen(false);
+    setBookingError("Payment was declined by the bank simulator (Simulated Failure).");
+    if (pendingBooking) {
+      setPaymentNotice(
+        `Payment window active. Your slot is reserved for 10 minutes (Ref: ${pendingBooking.bookingReference}). Complete payment or cancel to release immediately.`
+      );
+    }
+  };
+
+  const handleSimulatorDismiss = () => {
+    setSimulatorModalOpen(false);
+    if (pendingBooking) {
+      setPaymentNotice(
+        `Payment window active. Your slot is reserved for 10 minutes (Ref: ${pendingBooking.bookingReference}). Complete payment to confirm or cancel to release immediately.`
+      );
     }
   };
 
@@ -467,11 +522,25 @@ function App() {
       const bookingData = await createBooking(payload);
       setPendingBooking(bookingData);
 
-      // 2. Load Razorpay Checkout SDK script
+      // Check if we are running in Simulator Mode (placeholder credentials or simulated order)
+      const isSimulator =
+        paymentConfig?.isSimulator ||
+        paymentConfig?.keyId?.includes("placeholder") ||
+        bookingData.razorpayKeyId?.includes("placeholder") ||
+        bookingData.razorpayOrderId?.startsWith("order_sim_") ||
+        bookingData.razorpayOrderId?.startsWith("order_test_");
+
+      if (isSimulator) {
+        setIsSubmitting(false);
+        setSimulatorModalOpen(true);
+        return;
+      }
+
+      // 2. Load Razorpay Checkout SDK script for real keys
       const scriptLoaded = await loadRazorpayScript();
       if (!scriptLoaded) {
-        setBookingError("Unable to load Razorpay payment SDK. Please verify your connection.");
         setIsSubmitting(false);
+        setSimulatorModalOpen(true);
         return;
       }
 
@@ -863,13 +932,25 @@ function App() {
                       <Clock size={16} />
                       <span>{paymentNotice}</span>
                     </div>
-                    <button
-                      type="button"
-                      className="release-slot-inline-btn"
-                      onClick={handleCancelPendingReservation}
-                    >
-                      Release Slot
-                    </button>
+                    <div className="notice-actions-row">
+                      {pendingBooking && (
+                        <button
+                          type="button"
+                          className="resume-pay-inline-btn"
+                          onClick={() => setSimulatorModalOpen(true)}
+                        >
+                          <CreditCard size={13} />
+                          Pay Now
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="release-slot-inline-btn"
+                        onClick={handleCancelPendingReservation}
+                      >
+                        Release Slot
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1515,6 +1596,137 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Razorpay Test Sandbox Interactive Simulator Modal */}
+      {simulatorModalOpen && pendingBooking && (
+        <div className="turf-modal-backdrop" onClick={handleSimulatorDismiss}>
+          <section
+            className="turf-modal razorpay-sim-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sim-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="rzp-sim-header">
+              <div className="rzp-sim-brand">
+                <div className="rzp-badge-icon">
+                  <CreditCard size={20} />
+                </div>
+                <div>
+                  <div className="rzp-sim-title-row">
+                    <strong id="sim-modal-title">Razorpay Test Checkout</strong>
+                    <span className="rzp-test-pill">TEST SANDBOX</span>
+                  </div>
+                  <span className="rzp-sim-sub">TurfBook Sports · Instant Simulator</span>
+                </div>
+              </div>
+              <button
+                className="modal-close"
+                onClick={handleSimulatorDismiss}
+                aria-label="Close payment modal"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="rzp-sim-amount-banner">
+              <span className="rzp-amount-label">AMOUNT PAYABLE</span>
+              <strong className="rzp-amount-value">
+                ₹{Number(pendingBooking.totalPrice).toLocaleString("en-IN")}
+              </strong>
+              <div className="rzp-order-info">
+                <span>Order: <code>{pendingBooking.razorpayOrderId}</code></span>
+                <span>Ref: <strong>{pendingBooking.bookingReference}</strong></span>
+              </div>
+            </div>
+
+            <div className="rzp-sim-methods">
+              <span className="rzp-section-heading">Select Payment Method:</span>
+              <div className="rzp-methods-grid">
+                <button
+                  type="button"
+                  className={`rzp-method-card ${simulatorPaymentMethod === "card" ? "active" : ""}`}
+                  onClick={() => setSimulatorPaymentMethod("card")}
+                >
+                  <CreditCard size={18} className="rzp-method-icon" />
+                  <div className="rzp-method-text">
+                    <strong>Test Card</strong>
+                    <span>4000 •••• •••• 0002</span>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className={`rzp-method-card ${simulatorPaymentMethod === "upi" ? "active" : ""}`}
+                  onClick={() => setSimulatorPaymentMethod("upi")}
+                >
+                  <Smartphone size={18} className="rzp-method-icon" />
+                  <div className="rzp-method-text">
+                    <strong>Test UPI</strong>
+                    <span>player@razorpay</span>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className={`rzp-method-card ${simulatorPaymentMethod === "netbanking" ? "active" : ""}`}
+                  onClick={() => setSimulatorPaymentMethod("netbanking")}
+                >
+                  <Building2 size={18} className="rzp-method-icon" />
+                  <div className="rzp-method-text">
+                    <strong>NetBanking</strong>
+                    <span>HDFC / SBI / ICICI</span>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            <div className="rzp-sim-helper-note">
+              <ShieldCheck size={16} />
+              <span>
+                Simulated Sandbox Mode: No money is deducted. Completes authoritative server-side verification and confirms your reservation slot.
+              </span>
+            </div>
+
+            <div className="rzp-sim-actions">
+              <button
+                type="button"
+                className="rzp-pay-success-btn"
+                onClick={handleSimulatorSuccess}
+                disabled={isVerifyingPayment}
+              >
+                {isVerifyingPayment ? (
+                  "Verifying Payment with Server..."
+                ) : (
+                  <>
+                    <CheckCircle2 size={18} />
+                    Complete Test Payment · ₹{Number(pendingBooking.totalPrice).toLocaleString("en-IN")}
+                  </>
+                )}
+              </button>
+
+              <div className="rzp-secondary-actions">
+                <button
+                  type="button"
+                  className="rzp-pay-fail-btn"
+                  onClick={handleSimulatorFailure}
+                  disabled={isVerifyingPayment}
+                >
+                  Simulate Payment Failure
+                </button>
+                <button
+                  type="button"
+                  className="rzp-dismiss-btn"
+                  onClick={handleSimulatorDismiss}
+                  disabled={isVerifyingPayment}
+                >
+                  Cancel / Close
+                </button>
+              </div>
+            </div>
+          </section>
         </div>
       )}
 

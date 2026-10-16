@@ -29,7 +29,8 @@ public class PaymentController {
         return new PaymentConfigResponse(
                 razorpayService.getKeyId(),
                 "INR",
-                razorpayService.getPaymentWindowMinutes()
+                razorpayService.getPaymentWindowMinutes(),
+                razorpayService.isTestSimulator()
         );
     }
 

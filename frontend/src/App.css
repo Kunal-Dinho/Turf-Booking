@@ -1582,3 +1582,300 @@ footer p {
   color: #059669;
   margin-top: 1px;
 }
+
+/* Notice Action Row (Hold notice with Pay Now and Release Slot) */
+.notice-actions-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.resume-pay-inline-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffffff;
+  background: #059669;
+  border: 1px solid #047857;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.resume-pay-inline-btn:hover {
+  background: #047857;
+}
+
+/* Razorpay Test Sandbox Interactive Simulator Modal */
+.razorpay-sim-modal {
+  max-width: 490px;
+  width: 95%;
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 25px 60px -15px rgba(15, 23, 42, 0.35);
+  border: 1px solid #cbd5e1;
+}
+
+.rzp-sim-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 16px;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 12px;
+}
+
+.rzp-sim-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.rzp-badge-icon {
+  width: 40px;
+  height: 40px;
+  background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  box-shadow: 0 4px 10px rgba(2, 132, 199, 0.25);
+}
+
+.rzp-sim-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rzp-sim-title-row strong {
+  font-size: 16px;
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.rzp-test-pill {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  background: #fef3c7;
+  color: #b45309;
+  padding: 2px 7px;
+  border-radius: 9999px;
+  border: 1px solid #fde68a;
+}
+
+.rzp-sim-sub {
+  display: block;
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.rzp-sim-amount-banner {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 18px;
+  text-align: center;
+}
+
+.rzp-amount-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #64748b;
+  margin-bottom: 4px;
+}
+
+.rzp-amount-value {
+  display: block;
+  font-size: 28px;
+  font-weight: 800;
+  color: #0f172a;
+  letter-spacing: -0.02em;
+}
+
+.rzp-order-info {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.rzp-order-info code {
+  background: #e2e8f0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #1e293b;
+}
+
+.rzp-sim-methods {
+  margin-bottom: 16px;
+}
+
+.rzp-section-heading {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+}
+
+.rzp-methods-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.rzp-method-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 12px 8px;
+  background: #ffffff;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.rzp-method-card:hover {
+  border-color: #93c5fd;
+  background: #f8fafc;
+}
+
+.rzp-method-card.active {
+  border-color: #0284c7;
+  background: #f0f9ff;
+  box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.2);
+}
+
+.rzp-method-card .rzp-method-icon {
+  color: #0284c7;
+}
+
+.rzp-method-text strong {
+  display: block;
+  font-size: 12px;
+  color: #0f172a;
+}
+
+.rzp-method-text span {
+  display: block;
+  font-size: 10.5px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.rzp-sim-helper-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #166534;
+  margin-bottom: 18px;
+}
+
+.rzp-sim-helper-note svg {
+  flex-shrink: 0;
+  color: #16a34a;
+  margin-top: 2px;
+}
+
+.rzp-sim-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.rzp-pay-success-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 13px;
+  background: #059669;
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+  border: 1px solid #047857;
+  border-radius: 10px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(5, 150, 105, 0.25);
+  transition: all 0.15s ease;
+}
+
+.rzp-pay-success-btn:hover:not(:disabled) {
+  background: #047857;
+  box-shadow: 0 6px 16px rgba(5, 150, 105, 0.35);
+}
+
+.rzp-pay-success-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.rzp-secondary-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.rzp-pay-fail-btn {
+  flex: 1;
+  padding: 9px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.rzp-pay-fail-btn:hover:not(:disabled) {
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+
+.rzp-dismiss-btn {
+  padding: 9px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.rzp-dismiss-btn:hover:not(:disabled) {
+  background: #e2e8f0;
+  color: #1e293b;
+}

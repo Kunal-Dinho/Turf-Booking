@@ -65,8 +65,8 @@ public class SecurityConfig {
                 // Razorpay Payment endpoints: config, signature verification, webhooks, dismissal
                 .requestMatchers("/api/payments/**").permitAll()
 
-                // Health & DB checks
-                .requestMatchers("/api/health", "/api/db-check").permitAll()
+                // Health & DB checks, error dispatcher
+                .requestMatchers("/api/health", "/api/db-check", "/error").permitAll()
 
                 // Protected customer endpoints
                 .requestMatchers("/api/auth/me").authenticated()
